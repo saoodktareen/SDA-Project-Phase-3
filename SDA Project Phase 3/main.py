@@ -221,6 +221,12 @@ def bootstrap():
         w.join()
         print(f"[Main] {w.name} finished.")
 
+    # Safety net — terminate any worker that didn't exit cleanly
+    for w in worker_procs:
+        if w.is_alive():
+            print(f"[Main] Force-terminating {w.name}...")
+            w.terminate()
+
     # Join aggregator — wait for all averages to be computed
     aggregator_proc.join()
     print(f"[Main] {aggregator_proc.name} finished.")

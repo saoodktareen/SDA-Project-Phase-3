@@ -59,17 +59,9 @@ REQUIREMENTS
 ------------
   Python 3.8+
 
-  Standard library only (no pip installs required):
-    multiprocessing, hashlib, heapq, threading, collections,
-    time, json, csv, abc
+  Standard library only + ONE extra package:
+    pip install dash plotly
 
-  matplotlib must be installed:
-    pip install matplotlib
-
-  If the dashboard does not open, install TkAgg backend:
-    pip install tk
-    or
-    sudo apt-get install python3-tk   (Linux)
 
 ----------------------------------------------------------------
 

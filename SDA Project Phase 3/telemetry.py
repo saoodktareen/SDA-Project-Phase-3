@@ -180,6 +180,7 @@ class PipelineTelemetry:
         self._processed_queue    = processed_queue
         self._queue_max_size     = queue_max_size
         self._telemetry_config   = config["visualizations"]["telemetry"]
+        self._poll_interval      = config["pipeline_dynamics"].get("telemetry_poll_interval", 0.2)
 
         self._observers: list = []
         self._running    = False
@@ -249,7 +250,7 @@ class PipelineTelemetry:
                 # qsize() can raise on some platforms — handle gracefully
                 print(f"[Telemetry] Poll error: {e}")
 
-            time.sleep(self.POLL_INTERVAL_SECONDS)
+            time.sleep(self._poll_interval)
 
     # ── Lifecycle ─────────────────────────────────────────────
 
@@ -265,8 +266,7 @@ class PipelineTelemetry:
             daemon=True      # dies automatically when main process exits
         )
         self._thread.start()
-        print("[Telemetry] Started — polling every "
-              f"{self.POLL_INTERVAL_SECONDS:.2f}s")
+        print(f"[Telemetry] Started — polling every {self._poll_interval:.2f}s")
 
     def stop(self) -> None:
         """Stop the polling loop gracefully."""

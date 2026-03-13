@@ -3,7 +3,8 @@
   "pipeline_dynamics": {
     "input_delay_seconds": 0.01,
     "core_parallelism": 4,
-    "stream_queue_max_size": 50
+    "stream_queue_max_size": 50,
+    "telemetry_poll_interval": 0.2
   },
   "schema_mapping": {
     "columns": [

@@ -30,45 +30,42 @@ Patterns implemented:
 
 import hashlib
 import heapq
+import queue
 import time
 import collections
 import multiprocessing
-from typing import Optional
 
 
 # ─────────────────────────────────────────────────────────────
 #  FUNCTIONAL CORE — Pure Functions (no side effects, no state)
 # ─────────────────────────────────────────────────────────────
 
-def verify_signature(packet: dict, config: dict) -> bool:
+def verify_signature(packet: dict, secret_key: str, iterations: int) -> bool:
     """
     Pure function — verifies the cryptographic signature of a packet.
 
-    Extracts metric_value (as the salt) and security_hash from the packet,
-    then recomputes the PBKDF2-HMAC hash using the secret_key from config.
-
     Signature scheme (verified against sample_sensor_data.csv):
         password = secret_key (encoded as UTF-8 bytes)
-        salt     = str(metric_value) (encoded as UTF-8 bytes)
+        salt     = metric_value formatted to 2 decimal places (encoded as UTF-8 bytes)
         hash_fn  = sha256
-        iters    = iterations from config (100,000)
+        iters    = iterations (100,000)
 
     Args:
-        packet : generic data packet from InputModule
-        config : the processing.stateless_tasks block from config.json
+        packet      : generic data packet from InputModule
+        secret_key  : secret key string from config
+        iterations  : number of PBKDF2 iterations from config
 
     Returns:
         True if computed hash matches packet's security_hash, False otherwise.
     """
-    secret_key     = config["secret_key"].encode("utf-8")
-    iterations     = config["iterations"]
-    raw_value_str  = str(packet["metric_value"])
-    salt           = raw_value_str.encode("utf-8")
-    expected_hash  = packet["security_hash"]
+    key           = secret_key.encode("utf-8")
+    raw_value_str = f"{packet['metric_value']:.2f}"
+    salt          = raw_value_str.encode("utf-8")
+    expected_hash = packet["security_hash"]
 
     computed_hash = hashlib.pbkdf2_hmac(
         "sha256",
-        secret_key,
+        key,
         salt,
         iterations
     ).hex()
@@ -131,7 +128,9 @@ class CoreWorker:
             intermediate_queue : Queue 2 — pushes verified packets here
         """
         self.worker_id          = worker_id
-        self.sig_config         = config["processing"]["stateless_tasks"]
+        sig                     = config["processing"]["stateless_tasks"]
+        self.secret_key         = sig["secret_key"]
+        self.iterations         = sig["iterations"]
         self.raw_queue          = raw_queue
         self.intermediate_queue = intermediate_queue
 
@@ -168,13 +167,13 @@ class CoreWorker:
 
             packet_id = packet["packet_id"]
 
-            if verify_signature(packet, self.sig_config):
+            if verify_signature(packet, self.secret_key, self.iterations):
                 self.intermediate_queue.put((packet_id, packet))
                 verified_count += 1
-                print(f"[Worker {self.worker_id}] ✓ Packet #{packet_id:>4} verified")
+                print(f"[Worker {self.worker_id}] Verified packet {packet_id}")
             else:
                 dropped_count += 1
-                print(f"[Worker {self.worker_id}] ✗ Packet #{packet_id:>4} DROPPED (bad signature)")
+                print(f"[Worker {self.worker_id}] Dropped packet {packet_id} (bad signature)")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -291,11 +290,9 @@ class Aggregator:
         for a packet that will never arrive.
         """
         if time.time() - self.last_seen_time > CUTOFF_SECONDS:
-            print(f"[Aggregator] ⏱ Timeout — skipping packet #{self.next_expected} "
-                  f"(assumed dropped)")
+            print(f"[Aggregator] Timeout — skipping packet #{self.next_expected} (assumed dropped)")
             self.next_expected  += 1
-            self.last_seen_time  = time.time()
-            # Try releasing again — maybe the next ID is already in the heap
+            self.last_seen_time  = time.time()   # reset so we don't fire again immediately
             self._try_release()
 
     def run(self) -> None:
@@ -317,7 +314,7 @@ class Aggregator:
             # Non-blocking poll with short timeout so we can check cutoff
             try:
                 item = self.intermediate_queue.get(timeout=0.1)
-            except Exception:
+            except queue.Empty:
                 # Queue was empty — check cutoff, then loop
                 if self.sentinels_seen < self.num_workers:
                     self._apply_cutoff()
@@ -337,6 +334,10 @@ class Aggregator:
 
             # ── Normal verified packet ────────────────────────────────────
             packet_id, packet = item
+            # Ignore packets already skipped by cutoff timeout
+            if packet_id < self.next_expected:
+                print(f"[Aggregator] Ignoring stale packet #{packet_id} (already skipped by timeout)")
+                continue
             heapq.heappush(self.heap, (packet_id, packet))
             self._try_release()
 
@@ -353,12 +354,16 @@ class Aggregator:
         # Give a short window for any last items still in transit
         time.sleep(0.5)
 
-        # Drain any remaining items from the intermediate queue first
-        while not self.intermediate_queue.empty():
-            item = self.intermediate_queue.get_nowait()
-            if item is not None:
-                packet_id, packet = item
-                heapq.heappush(self.heap, (packet_id, packet))
+        # Drain remaining items using try/except — .empty() is unreliable in multiprocessing
+        while True:
+            try:
+                item = self.intermediate_queue.get_nowait()
+                if item is not None:
+                    packet_id, packet = item
+                    if packet_id >= self.next_expected:
+                        heapq.heappush(self.heap, (packet_id, packet))
+            except queue.Empty:
+                break
 
         # Now release everything left in heap, skipping missing IDs
         while self.heap:
@@ -368,5 +373,10 @@ class Aggregator:
             while self.next_expected < next_in_heap:
                 print(f"[Aggregator] Drain — skipping missing #{self.next_expected}")
                 self.next_expected += 1
+
+            # Discard stale packets that fell behind next_expected
+            if self.heap and self.heap[0][0] < self.next_expected:
+                heapq.heappop(self.heap)
+                continue
 
             self._try_release()
