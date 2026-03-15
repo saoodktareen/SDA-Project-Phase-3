@@ -1,15 +1,6 @@
-"""
-read_config.py — Configuration Loader
-======================================
-Loads config.json from disk, validates it using validate_config,
-and returns the config dict. Exits with a clear error message if
-the file is missing, contains invalid JSON, or fails validation.
-"""
-
 import sys
 import json
 from config.validate_config import validate_config
-
 
 def load_config(path: str = "config.json") -> dict:
     """
@@ -20,7 +11,7 @@ def load_config(path: str = "config.json") -> dict:
       - The file contains invalid JSON
       - Any required field is missing or invalid (caught by validate_config)
 
-    Args:
+    Argument:
         path : path to the config JSON file (default: 'config.json')
 
     Returns:
