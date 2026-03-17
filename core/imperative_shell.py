@@ -1,6 +1,6 @@
 """
-core_module.py — Generic Core: Verification Workers + Aggregator
-=================================================================
+imperative_shell.py — Generic Core: Verification Workers + Aggregator
+======================================================================
 This module is completely domain-agnostic. It never imports anything
 related to sensors, GDP, or any specific dataset.
 
@@ -10,22 +10,29 @@ Two classes live here:
    - Pulls packets from raw_queue (Queue 1)
    - Verifies the cryptographic signature using PBKDF2-HMAC
    - Drops packets that fail verification
-   - Pushes verified (packet_id, packet) into intermediate_queue (Queue 2)
-   - Implements the Scatter-Gather pattern — N workers run in parallel
+   - Pushes verified (priority_index, packet) into intermediate_queue (Queue 2)
+   - Implements the Scatter part of Scatter-Gather — N workers run in parallel
 
 2. Aggregator  (Stateful, Single Process)
    - Pulls verified packets from intermediate_queue (Queue 2)
-   - Re-sequences them using a min-heap priority queue (teacher's solution)
-   - Applies a timeout/cutoff for packets that never arrive (dropped by workers)
-   - Computes sliding window running average using Functional Core pattern
+   - Re-sequences them using a min-heap (priority queue) on priority_index
+   - Applies a timeout/cutoff for packets dropped by workers (bad signature)
+   - Computes sliding window running average — Functional Core, Imperative Shell
    - Pushes fully processed packets into processed_queue (Queue 3)
 
-Patterns implemented:
+Patterns implemented (per PDF):
   - Scatter-Gather         : N parallel CoreWorker processes
-  - Functional Core        : pure compute_average() function
-  - Imperative Shell       : Aggregator class manages all state
-  - Priority Queue         : heapq for re-sequencing
-  - Timeout/Cutoff         : skips missing packet IDs after CUTOFF_SECONDS
+  - Functional Core        : pure verify_signature() and compute_average()
+  - Imperative Shell       : Aggregator owns ALL mutable state
+  - Priority Queue / heap  : heapq for strict re-sequencing
+  - Timeout / Cutoff       : skips missing priority_index after CUTOFF_SECONDS
+
+DIP compliance:
+  - CoreWorker depends only on two Queues and config values (strings/ints).
+    It has zero knowledge of InputModule, Aggregator, or OutputModule.
+  - Aggregator depends only on two Queues and config values.
+    It has zero knowledge of CoreWorker internals or OutputModule.
+  - Both are instantiated and wired by main.py (the orchestrator).
 """
 
 import heapq
@@ -35,27 +42,28 @@ import collections
 import multiprocessing
 from core.functional_core import verify_signature, compute_average
 
-# ─────────────────────────────────────────────────────────────
-#  CoreWorker — Stateless Parallel Verification Process
-# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CoreWorker — Stateless Parallel Verification (Scatter)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class CoreWorker:
     """
     Stateless parallel worker — implements the Scatter part of Scatter-Gather.
 
     Each CoreWorker runs as an independent multiprocessing.Process.
-    Multiple workers pull from the same raw_queue concurrently, so
-    packets are processed in parallel across CPU cores.
+    Multiple workers pull from the same raw_queue concurrently so packets
+    are verified in parallel across CPU cores.
 
-    The worker is completely unaware of:
-      - What the data represents (sensor, climate, health metrics, etc.)
-      - How many other workers exist
-      - What happens to packets after verification
+    The worker is completely domain-agnostic:
+      - It does not know what the data represents.
+      - It does not know how many other workers exist.
+      - It does not know what happens to packets after verification.
 
-    It only knows: pull packet → verify → forward or drop.
+    Contract: pull packet → verify signature → forward or drop.
     """
 
-    SENTINEL = None  # Poison pill signal sent by main.py to stop workers
+    SENTINEL = None  # Poison pill sent by main.py — one per worker
 
     def __init__(
         self,
@@ -65,11 +73,12 @@ class CoreWorker:
         intermediate_queue: multiprocessing.Queue,
     ):
         """
-        Args:
-            worker_id          : integer ID for logging (0, 1, 2, 3)
-            config             : full config.json dict
-            raw_queue          : Queue 1 — pulls packets from here
-            intermediate_queue : Queue 2 — pushes verified packets here
+        Parameters
+        ----------
+        worker_id          : integer label for logging (0, 1, 2, ...)
+        config             : full validated config dict from main.py
+        raw_queue          : Queue 1 — pulls raw packets from here
+        intermediate_queue : Queue 2 — pushes verified packets here
         """
         self.worker_id          = worker_id
         sig                     = config["processing"]["stateless_tasks"]
@@ -82,16 +91,16 @@ class CoreWorker:
         """
         Main loop — runs inside a multiprocessing.Process.
 
-        Continuously pulls packets from raw_queue until it receives
-        the sentinel (None), which signals the stream has ended.
+        Pulls packets from raw_queue until a sentinel (None) is received.
 
         For each packet:
-          - Calls verify_signature() (pure function)
-          - If valid: forwards (packet_id, packet) to intermediate_queue
-          - If invalid: logs and drops the packet
-        
-        On receiving sentinel, forwards one sentinel downstream so the
-        Aggregator also knows this worker is done.
+          - Reads priority_index (set by InputModule, 1-based)
+          - Calls verify_signature() — pure function from functional_core
+          - Verified  → pushes (priority_index, packet) to intermediate_queue
+          - Unverified → logs and drops the packet
+
+        On sentinel: forwards one sentinel to intermediate_queue so the
+        Aggregator can count how many workers have finished.
         """
         verified_count = 0
         dropped_count  = 0
@@ -99,35 +108,39 @@ class CoreWorker:
         print(f"[Worker {self.worker_id}] Started.")
 
         while True:
-            packet = self.raw_queue.get()
+            packet = self.raw_queue.get()  # blocks until item available
 
-            # Sentinel received — stream is over for this worker
+            # ── Sentinel: stream is over for this worker ──────────────────
             if packet is self.SENTINEL:
-                print(f"[Worker {self.worker_id}] Sentinel received. "
-                      f"Verified={verified_count}, Dropped={dropped_count}")
-                # Forward sentinel so Aggregator knows one worker finished
+                print(f"[Worker {self.worker_id}] Sentinel received — "
+                      f"verified={verified_count}, dropped={dropped_count}")
+                # Forward one sentinel so Aggregator knows this worker finished
                 self.intermediate_queue.put(self.SENTINEL)
                 break
 
-            packet_id = packet["packet_id"]
+            # ── Normal packet ─────────────────────────────────────────────
+            # Use priority_index (1-based, set by InputModule) as the
+            # ordering key for the Aggregator's min-heap re-sequencing.
+            priority_index = packet["priority_index"]
 
             if verify_signature(packet, self.secret_key, self.iterations):
-                self.intermediate_queue.put((packet_id, packet))
+                # Push as (priority_index, packet) tuple so Aggregator can heap-sort
+                self.intermediate_queue.put((priority_index, packet))
                 verified_count += 1
-                print(f"[Worker {self.worker_id}] Verified packet {packet_id}")
+                print(f"[Worker {self.worker_id}] Verified   #{priority_index}")
             else:
                 dropped_count += 1
-                print(f"[Worker {self.worker_id}] Dropped packet {packet_id} (bad signature)")
+                print(f"[Worker {self.worker_id}] Dropped    #{priority_index} "
+                      f"(signature mismatch)")
 
 
-# ─────────────────────────────────────────────────────────────
-#  Aggregator — Stateful Re-sequencing + Sliding Window
-#  Implements: Imperative Shell (state) + Functional Core (math)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Aggregator — Stateful Re-sequencing + Sliding Window  (Gather)
+#  Pattern: Functional Core, Imperative Shell
+# ─────────────────────────────────────────────────────────────────────────────
 
-# How many seconds to wait for a missing packet_id before skipping it.
-# If a packet was dropped by a worker (bad signature), we'd wait forever
-# without this cutoff.
+# Seconds to wait for a missing priority_index before skipping it.
+# Without this, a dropped packet (bad signature) would stall the pipeline forever.
 CUTOFF_SECONDS = 2.0
 
 
@@ -136,29 +149,29 @@ class Aggregator:
     Single-process Aggregator — implements the Gather part of Scatter-Gather.
 
     Responsibilities:
-      1. Collect verified packets from intermediate_queue (Queue 2)
-      2. Re-sequence them in strict packet_id order using a min-heap
-      3. Skip missing IDs after CUTOFF_SECONDS (dropped packets)
-      4. Maintain a sliding window of the last N metric_values
-      5. Call compute_average() (pure function) to get running average
-      6. Attach computed_metric to each packet
+      1. Collect verified (priority_index, packet) tuples from intermediate_queue
+      2. Re-sequence them in strict priority_index order using a min-heap
+      3. Skip missing indices after CUTOFF_SECONDS (packets dropped by workers)
+      4. Maintain a sliding window of the last N metric_values (Imperative Shell)
+      5. Call compute_average(window) — pure Functional Core — to get running avg
+      6. Attach computed_metric to each packet before forwarding
       7. Push completed packets to processed_queue (Queue 3)
 
     Why a single process?
-      The sliding window average is inherently stateful and sequential —
-      average of packets 0..9 must be computed before 1..10. Parallelising
-      this would require synchronisation that defeats the purpose.
+      The sliding window average is inherently sequential — the average of
+      packets 1..10 must be computed before 2..11. Parallelising this would
+      break ordering and require synchronisation that defeats the purpose.
 
-    Imperative Shell:
-      This class IS the imperative shell. It owns all mutable state:
-        - self.heap          (the priority queue)
-        - self.window        (the sliding window deque)
-        - self.next_expected (which packet_id we want next)
-        - self.last_seen_time (for cutoff timing)
+    Imperative Shell (this class owns ALL mutable state):
+      self.heap           — min-heap for re-sequencing
+      self.window         — sliding window deque
+      self.next_expected  — which priority_index to release next (starts at 1)
+      self.last_seen_time — timestamp of last successful release (for cutoff)
+      self.sentinels_seen — count of worker-done signals received
 
-    Functional Core:
-      compute_average(window) — called here but defined above as a
-      pure function with no access to self or any shared state.
+    Functional Core (pure functions, no state):
+      compute_average(window) — imported from functional_core.py
+      verify_signature(...)   — used by CoreWorker, also from functional_core.py
     """
 
     def __init__(
@@ -169,158 +182,167 @@ class Aggregator:
         num_workers: int,
     ):
         """
-        Args:
-            config             : full config.json dict
-            intermediate_queue : Queue 2 — pulls (packet_id, packet) from here
-            processed_queue    : Queue 3 — pushes completed packets here
-            num_workers        : how many CoreWorkers exist (to count sentinels)
+        Parameters
+        ----------
+        config             : full validated config dict from main.py
+        intermediate_queue : Queue 2 — pulls (priority_index, packet) from here
+        processed_queue    : Queue 3 — pushes completed packets here
+        num_workers        : number of CoreWorkers (to know when all are done)
         """
         window_size = config["processing"]["stateful_tasks"]["running_average_window_size"]
 
-        # ── Imperative Shell State ────────────────────────────────────────
+        # ── Queues (passed in — Aggregator does not create them) ──────────
         self.intermediate_queue = intermediate_queue
         self.processed_queue    = processed_queue
         self.num_workers        = num_workers
 
-        self.heap           = []                              # min-heap: (packet_id, packet)
+        # ── Imperative Shell State ────────────────────────────────────────
+        self.heap           = []                                     # min-heap (priority_index, packet)
         self.window         = collections.deque(maxlen=window_size)  # sliding window
-        self.next_expected  = 0                               # next packet_id to release
-        self.last_seen_time = time.time()                     # for cutoff detection
-        self.sentinels_seen = 0                               # count worker completions
+        self.next_expected  = 1          # MUST start at 1 — InputModule priority_index is 1-based
+        self.last_seen_time = time.time()
+        self.sentinels_seen = 0
+
+    # ── Private helpers (Imperative Shell methods) ────────────────────────
 
     def _try_release(self) -> None:
         """
-        Imperative Shell method — attempts to release packets from the
-        heap in strict packet_id order.
+        Release packets from the heap in strict priority_index order.
 
-        A packet is released when:
-          heap[0].packet_id == self.next_expected
-
-        After release, calls the Functional Core (compute_average) and
-        attaches the result to the packet before forwarding downstream.
+        Pops from the heap only when heap[0][0] == self.next_expected.
+        For each released packet:
+          1. Appends metric_value to the sliding window  (Imperative Shell — state)
+          2. Calls compute_average(window)               (Functional Core  — pure)
+          3. Attaches computed_metric to the packet
+          4. Forwards to processed_queue
         """
         while self.heap and self.heap[0][0] == self.next_expected:
             _, packet = heapq.heappop(self.heap)
 
-            # Add metric_value to sliding window (Imperative Shell manages state)
+            # Imperative Shell: update mutable sliding window state
             self.window.append(packet["metric_value"])
 
-            # Call Functional Core — pure function, no side effects
+            # Functional Core: pure function — no side effects, no self
             avg = compute_average(list(self.window))
 
-            # Attach computed result to packet
+            # Attach result and forward downstream
             packet["computed_metric"] = round(avg, 4)
-
-            # Forward to output
             self.processed_queue.put(packet)
 
             print(f"[Aggregator] Released #{self.next_expected:>4} | "
                   f"metric={packet['metric_value']:.2f} | "
                   f"avg={packet['computed_metric']:.4f} | "
-                  f"window_size={len(self.window)}")
+                  f"window={len(self.window)}")
 
             self.next_expected  += 1
             self.last_seen_time  = time.time()
 
     def _apply_cutoff(self) -> None:
         """
-        Imperative Shell method — handles the timeout/cutoff logic.
+        If CUTOFF_SECONDS have elapsed since the last successful release,
+        assume the next expected packet was dropped (bad signature) and skip it.
 
-        If CUTOFF_SECONDS have passed since we last released a packet,
-        the next expected packet_id is assumed to have been dropped by
-        a worker (failed signature verification). We skip it and move on.
-
-        This prevents the pipeline from stalling indefinitely waiting
-        for a packet that will never arrive.
+        Increments next_expected by 1 and immediately calls _try_release()
+        in case packets further ahead are already sitting in the heap.
         """
         if time.time() - self.last_seen_time > CUTOFF_SECONDS:
-            print(f"[Aggregator] Timeout — skipping packet #{self.next_expected} (assumed dropped)")
+            print(f"[Aggregator] Timeout — skipping #{self.next_expected} "
+                  f"(assumed dropped by worker)")
             self.next_expected  += 1
-            self.last_seen_time  = time.time()   # reset so we don't fire again immediately
+            self.last_seen_time  = time.time()  # reset to avoid rapid-fire skips
             self._try_release()
-
-    def run(self) -> None:
-        """
-        Main loop — runs inside a multiprocessing.Process.
-
-        Continuously pulls from intermediate_queue.
-        Items can be:
-          - (packet_id, packet) tuple  → verified packet from a CoreWorker
-          - None (sentinel)            → one CoreWorker has finished
-
-        When all num_workers sentinels are received, drains any remaining
-        packets from the heap (with cutoff for any final missing IDs),
-        then sends a sentinel downstream to signal the Output module.
-        """
-        print(f"[Aggregator] Started. Expecting packets from {self.num_workers} workers.")
-
-        while True:
-            # Non-blocking poll with short timeout so we can check cutoff
-            try:
-                item = self.intermediate_queue.get(timeout=0.1)
-            except queue.Empty:
-                # Queue was empty — check cutoff, then loop
-                if self.sentinels_seen < self.num_workers:
-                    self._apply_cutoff()
-                continue
-
-            # ── Sentinel received from a worker ──────────────────────────
-            if item is None:
-                self.sentinels_seen += 1
-                print(f"[Aggregator] Worker sentinel {self.sentinels_seen}/{self.num_workers} received.")
-
-                if self.sentinels_seen == self.num_workers:
-                    # All workers done — drain remaining heap
-                    print("[Aggregator] All workers done. Draining remaining packets...")
-                    self._drain_remaining()
-                    break
-                continue
-
-            # ── Normal verified packet ────────────────────────────────────
-            packet_id, packet = item
-            # Ignore packets already skipped by cutoff timeout
-            if packet_id < self.next_expected:
-                print(f"[Aggregator] Ignoring stale packet #{packet_id} (already skipped by timeout)")
-                continue
-            heapq.heappush(self.heap, (packet_id, packet))
-            self._try_release()
-
-        # Signal Output module that the stream is over
-        self.processed_queue.put(None)
-        print("[Aggregator] Done. Sentinel sent to Output.")
 
     def _drain_remaining(self) -> None:
         """
-        After all workers finish, some packets may still be sitting
-        in the heap waiting for a missing predecessor ID.
-        This drains them with cutoff logic so nothing is left behind.
+        Called after all CoreWorkers have finished.
+
+        Drains any last packets still in transit in intermediate_queue,
+        pushes them onto the heap, then releases everything with cutoff
+        logic for any gaps left by dropped packets.
         """
-        # Give a short window for any last items still in transit
+        # Brief pause — last packets may still be in transit through the queue
         time.sleep(0.5)
 
-        # Drain remaining items using try/except — .empty() is unreliable in multiprocessing
+        # Drain all remaining items (.empty() is unreliable in multiprocessing)
         while True:
             try:
                 item = self.intermediate_queue.get_nowait()
                 if item is not None:
-                    packet_id, packet = item
-                    if packet_id >= self.next_expected:
-                        heapq.heappush(self.heap, (packet_id, packet))
+                    priority_index, packet = item
+                    if priority_index >= self.next_expected:
+                        heapq.heappush(self.heap, (priority_index, packet))
             except queue.Empty:
                 break
 
-        # Now release everything left in heap, skipping missing IDs
+        # Release all remaining heap items, skipping any missing indices
         while self.heap:
             next_in_heap = self.heap[0][0]
 
-            # Skip any missing IDs between next_expected and next in heap
+            # Skip over any gaps (dropped packets between next_expected and heap top)
             while self.next_expected < next_in_heap:
                 print(f"[Aggregator] Drain — skipping missing #{self.next_expected}")
                 self.next_expected += 1
 
-            # Discard stale packets that fell behind next_expected
+            # Discard any stale packets that somehow ended up below next_expected
             if self.heap and self.heap[0][0] < self.next_expected:
                 heapq.heappop(self.heap)
                 continue
 
             self._try_release()
+
+    # ── Public entry point ────────────────────────────────────────────────
+
+    def run(self) -> None:
+        """
+        Main loop — runs inside a multiprocessing.Process.
+
+        Continuously pulls from intermediate_queue. Items are either:
+          - (priority_index, packet) tuple  → verified packet from a CoreWorker
+          - None (sentinel)                 → one CoreWorker has finished
+
+        Uses get(timeout=0.1) instead of blocking get() so the cutoff
+        timer can be checked even when the queue is temporarily empty.
+
+        When all num_workers sentinels are received:
+          1. Drains any remaining in-flight packets
+          2. Sends a None sentinel to processed_queue to signal Output
+        """
+        print(f"[Aggregator] Started — waiting for {self.num_workers} workers.")
+
+        while True:
+            # Non-blocking poll with short timeout to allow cutoff checks
+            try:
+                item = self.intermediate_queue.get(timeout=0.1)
+            except queue.Empty:
+                # No item available — check if a packet is overdue
+                if self.sentinels_seen < self.num_workers:
+                    self._apply_cutoff()
+                continue
+
+            # ── Sentinel: one CoreWorker has finished ─────────────────────
+            if item is None:
+                self.sentinels_seen += 1
+                print(f"[Aggregator] Worker done "
+                      f"({self.sentinels_seen}/{self.num_workers})")
+
+                if self.sentinels_seen == self.num_workers:
+                    print("[Aggregator] All workers done — draining heap ...")
+                    self._drain_remaining()
+                    break
+                continue
+
+            # ── Normal verified packet ────────────────────────────────────
+            priority_index, packet = item
+
+            # Ignore packets already skipped by the cutoff timer
+            if priority_index < self.next_expected:
+                print(f"[Aggregator] Ignoring stale #{priority_index} "
+                      f"(already skipped by timeout)")
+                continue
+
+            heapq.heappush(self.heap, (priority_index, packet))
+            self._try_release()
+
+        # Signal Output module that all processed data has been sent
+        self.processed_queue.put(None)
+        print("[Aggregator] Done — sentinel sent to Output.")
