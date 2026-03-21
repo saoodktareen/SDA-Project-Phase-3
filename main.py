@@ -21,17 +21,26 @@ Process map:
   └─────────────────────────────────────────────────────────┘
 
 Sentinel strategy:
-  - main.py sends N sentinels (None) into raw_stream after Input finishes,
-    one per CoreWorker, so every worker receives exactly one stop signal.
-  - Each CoreWorker forwards one sentinel to intermediate_queue when done.
-  - Aggregator counts N sentinels, then sends one sentinel to processed_queue.
-  - OutputModule sees the sentinel and marks the stream as complete.
+  - main.py joins InputProcess, THEN pushes N sentinels into raw_stream.
+    One sentinel per CoreWorker so every worker receives exactly one stop
+    signal. This is done by main.py — NOT inside run_input() — because
+    only main.py knows core_parallelism AND needs to pass error data back
+    from InputModule via the shared Manager dict.
+  - Each CoreWorker receives one sentinel → forwards one to intermediate_queue.
+  - Aggregator counts N sentinels → drains heap → sends one to processed_queue.
+  - OutputModule receives that sentinel → marks stream complete → closes.
 
-Startup order (important):
-  Output first  -> dashboard window opens before data flows
-  Aggregator    -> ready to receive before workers send
-  Workers       -> ready to consume before input sends
-  Input last    -> drives the whole pipeline
+Startup order (important — consumers before producers):
+  Output first  → dashboard window opens before data flows
+  Aggregator    → ready to receive before workers send
+  Workers       → ready to consume before input sends
+  Input last    → drives the whole pipeline
+
+DIP compliance:
+  - main.py is the ONLY file that imports all modules and wires them.
+  - No module imports any other module — they only receive queues + config.
+  - Inter-module communication happens exclusively through the three queues
+    and the shared Manager dict.
 """
 
 import time
@@ -46,22 +55,33 @@ from plugins.telemetry     import PipelineTelemetry
 
 # ─────────────────────────────────────────────────────────────
 #  Process target functions
-#  Must be top-level (not methods) for multiprocessing on Windows
+#  Must be module-level (not methods/lambdas) for multiprocessing
+#  on Windows which uses the 'spawn' start method and pickles targets.
 # ─────────────────────────────────────────────────────────────
 
-def run_input(config, raw_stream):
+def run_input(config, raw_stream, error_dict, ready_event, start_event):
     """
     Target for the Input producer process.
-    Runs InputModule then pushes one sentinel per CoreWorker into
-    raw_stream so every worker knows when to stop.
+
+    Runs InputModule.run() to load, validate, and stream all packets.
+    After run() completes, writes fatal_errors and skipped_rows into
+    the shared Manager dict so OutputModule can display them.
+
+    Sets ready_event AFTER writing errors so Screen 1 on the dashboard
+    waits for the real error state before drawing — fixing the timing
+    bug where Screen 1 always showed green because it drew before Input
+    had a chance to detect missing columns.
+
+    Sentinels are NOT pushed here. main.py pushes them after
+    input_proc.join() because only main.py knows core_parallelism.
     """
-    module = InputModule(config, raw_stream)
+    module = InputModule(config, raw_stream, ready_event, start_event)
     module.run()
 
-    num_workers = config["pipeline_dynamics"]["core_parallelism"]
-    print(f"[Input] Sending {num_workers} sentinels to stop workers...")
-    for _ in range(num_workers):
-        raw_stream.put(None)
+    # Write errors after run() — ready_event was already set inside run()
+    # right before streaming started, so error_dict is populated before set()
+    error_dict["fatal_errors"] = module.fatal_errors
+    error_dict["skipped_rows"] = module.skipped_rows
 
 
 def run_worker(worker_id, config, raw_stream, intermediate_queue):
@@ -75,32 +95,36 @@ def run_worker(worker_id, config, raw_stream, intermediate_queue):
     worker.run()
 
 
-def run_aggregator(config, intermediate_queue, processed_queue, num_workers):
+def run_aggregator(config, intermediate_queue, processed_queue, num_workers, start_event):
     """Target for the single Aggregator process."""
     aggregator = Aggregator(
         config,
         intermediate_queue,
         processed_queue,
         num_workers,
+        start_event,
     )
     aggregator.run()
 
 
-def run_output(config, processed_queue, raw_stream, intermediate_queue):
+def run_output(config, processed_queue, raw_stream, intermediate_queue,
+               error_dict, ready_event, start_event):
     """
     Target for the Output (dashboard) process.
 
-    Also creates and starts the PipelineTelemetry subject inside this
-    same process so it can call qsize() directly on the queue objects.
-    The OutputModule subscribes itself as the Observer before the
-    telemetry thread starts polling.
+    Creates PipelineTelemetry (Subject) inside this same process so it
+    can call qsize() directly on the queue objects.
+
+    Passes ready_event to OutputModule so Screen 1 waits for Input to
+    finish validation before drawing the error/status screen.
     """
     queue_max = config["pipeline_dynamics"]["stream_queue_max_size"]
 
-    # Create the Output module — it is also a TelemetryObserver
-    output = OutputModule(config, processed_queue)
+    # OutputModule — Observer, reads Q3 and renders dashboard
+    output = OutputModule(config, processed_queue, error_dict,
+                          ready_event, start_event)
 
-    # Create the Telemetry subject and subscribe the dashboard to it
+    # PipelineTelemetry — Subject, polls queue sizes on a background thread
     telemetry = PipelineTelemetry(
         raw_stream         = raw_stream,
         intermediate_queue = intermediate_queue,
@@ -108,10 +132,14 @@ def run_output(config, processed_queue, raw_stream, intermediate_queue):
         queue_max_size     = queue_max,
         config             = config,
     )
-    telemetry.subscribe(output)   # Observer pattern — dashboard receives updates
-    telemetry.start()             # daemon thread starts polling queue sizes
 
-    # Run the dashboard — blocks until the window is closed
+    # Observer Pattern: dashboard subscribes to telemetry subject
+    telemetry.subscribe(output)
+
+    # Start polling — daemon thread, dies when process exits
+    telemetry.start()
+
+    # Run dashboard — blocks until window is closed by user
     output.run()
 
     telemetry.stop()
@@ -123,13 +151,17 @@ def run_output(config, processed_queue, raw_stream, intermediate_queue):
 
 def bootstrap():
     """
-    Loads config, creates queues, wires all processes, starts them
-    in the correct order, and joins them cleanly on completion.
+    Loads config, creates queues and shared Manager objects,
+    wires all processes, starts them in the correct order,
+    and joins them cleanly on completion.
     """
     print("=" * 60)
     print("  Phase 3 — Generic Concurrent Real-Time Pipeline")
     print("=" * 60)
 
+    # ── Step 1: Load and validate configuration ───────────────
+    # load_config() calls validate_config() internally.
+    # Any error is printed and sys.exit(1) fires — no process spawned.
     config      = load_config("config.json")
     num_workers = config["pipeline_dynamics"]["core_parallelism"]
     queue_max   = config["pipeline_dynamics"]["stream_queue_max_size"]
@@ -140,17 +172,36 @@ def bootstrap():
     print(f"[Main] Delay      : {config['pipeline_dynamics']['input_delay_seconds']}s per packet")
     print("=" * 60)
 
-    # ── Create bounded queues ─────────────────────────────────
-    raw_stream         = multiprocessing.Queue(maxsize=queue_max)
-    intermediate_queue = multiprocessing.Queue(maxsize=queue_max)
-    processed_queue    = multiprocessing.Queue(maxsize=queue_max)
+    # ── Step 2: Create bounded queues ────────────────────────
+    # maxsize IS the backpressure — put() blocks when full automatically.
+    raw_stream         = multiprocessing.Queue(maxsize=queue_max)  # Q1
+    intermediate_queue = multiprocessing.Queue(maxsize=queue_max)  # Q2
+    processed_queue    = multiprocessing.Queue(maxsize=queue_max)  # Q3
 
-    # ── Create all process objects ────────────────────────────
+    # ── Step 3: Create shared Manager dict ───────────────────
+    # The Manager creates a proxy dict that is safe to read and write
+    # across processes. InputModule writes errors here after it finishes;
+    # OutputModule reads from here to display them on the dashboard.
+    manager    = multiprocessing.Manager()
+    error_dict = manager.dict()
+    error_dict["fatal_errors"] = []
+    error_dict["skipped_rows"] = []
 
-    # Output process — starts first so dashboard is ready before data flows
+    # ready_event is set by run_input() after InputModule.run() finishes
+    # and error_dict is written. Screen 1 in OutputModule waits on this
+    # event before drawing so it always shows the real error state.
+    ready_event = multiprocessing.Event()
+
+    # start_event: set by button click, unblocks Input + Aggregator
+    start_event = multiprocessing.Event()
+
+    # ── Step 4: Create all process objects ───────────────────
+
+    # Output — starts first so dashboard is ready before data flows
     output_proc = multiprocessing.Process(
         target = run_output,
-        args   = (config, processed_queue, raw_stream, intermediate_queue),
+        args   = (config, processed_queue, raw_stream, intermediate_queue,
+                  error_dict, ready_event, start_event),
         name   = "OutputProcess",
         daemon = False,
     )
@@ -158,7 +209,7 @@ def bootstrap():
     # Aggregator — single process, gathers from all workers
     aggregator_proc = multiprocessing.Process(
         target = run_aggregator,
-        args   = (config, intermediate_queue, processed_queue, num_workers),
+        args   = (config, intermediate_queue, processed_queue, num_workers, start_event),
         name   = "AggregatorProcess",
         daemon = False,
     )
@@ -174,63 +225,82 @@ def bootstrap():
         for i in range(num_workers)
     ]
 
-    # Input process — started last, it drives everything
+    # Input — started last, it drives the whole pipeline
     input_proc = multiprocessing.Process(
         target = run_input,
-        args   = (config, raw_stream),
+        args   = (config, raw_stream, error_dict, ready_event, start_event),
         name   = "InputProcess",
         daemon = False,
     )
 
-    # ── Start processes in correct order ──────────────────────
+    # ── Step 5: Start in correct order ───────────────────────
+    # Consumers must be ready before their upstream producer starts.
+    # Rule: Output → Aggregator → Workers → Input
 
-    # 1. Output first — dashboard window opens before data flows
     output_proc.start()
-    print(f"[Main] Started : {output_proc.name}")
+    print(f"[Main] Started : {output_proc.name} (PID {output_proc.pid})")
 
-    # Brief pause so the dashboard has time to open before data arrives
+    # Brief pause so the dashboard window opens before data arrives
     time.sleep(1.5)
 
-    # 2. Aggregator — ready to receive before workers start sending
     aggregator_proc.start()
-    print(f"[Main] Started : {aggregator_proc.name}")
+    print(f"[Main] Started : {aggregator_proc.name} (PID {aggregator_proc.pid})")
 
-    # 3. Workers — ready to consume before input starts producing
     for w in worker_procs:
         w.start()
-        print(f"[Main] Started : {w.name}")
+        print(f"[Main] Started : {w.name} (PID {w.pid})")
 
-    # 4. Input last — starts the data flowing through the pipeline
     input_proc.start()
-    print(f"[Main] Started : {input_proc.name}")
+    print(f"[Main] Started : {input_proc.name} (PID {input_proc.pid})")
 
     print("[Main] All processes running.")
     print("[Main] Close the dashboard window to exit.")
 
-    # ── Join processes in completion order ────────────────────
+    # ── Step 6: Join and push sentinels ──────────────────────
 
-    # Input finishes first — all rows have been pushed to raw_stream
+    # Wait for Input to finish pushing all packets
     input_proc.join()
     print(f"[Main] {input_proc.name} finished.")
 
-    # Workers finish after all packets are verified or dropped
+    # NOW push N sentinels into raw_stream — one per CoreWorker.
+    # Done here (not inside run_input) because:
+    #   - main.py owns core_parallelism
+    #   - error_dict is already written by run_input at this point
+    #   - pushing after join() guarantees all real packets are already in
+    #     the queue before any sentinel arrives at a worker
+    print(f"[Main] Pushing {num_workers} sentinel(s) into raw_stream...")
+    for _ in range(num_workers):
+        raw_stream.put(None)
+
+    # ── Step 7: Join remaining processes in order ─────────────
+
+    # Workers finish after consuming all packets + their sentinel
     for w in worker_procs:
         w.join()
         print(f"[Main] {w.name} finished.")
 
-    # Safety net — force-terminate any worker that hung
+    # Safety net — force-terminate any worker that somehow hung
     for w in worker_procs:
         if w.is_alive():
-            print(f"[Main] Force-terminating {w.name}...")
+            print(f"[Main] WARNING — force-terminating {w.name}...")
             w.terminate()
 
-    # Aggregator finishes after all averages are computed
+    # Aggregator finishes after all verified packets are processed
     aggregator_proc.join()
     print(f"[Main] {aggregator_proc.name} finished.")
 
-    # Output finishes when the dashboard window is closed by the user
+    # Output finishes when the user closes the dashboard window
     output_proc.join()
     print(f"[Main] {output_proc.name} finished.")
+
+    # Safety net: if user closed the window WITHOUT clicking the button,
+    # start_event was never set. Any process still blocked on
+    # start_event.wait() would hang forever. Setting it here unblocks
+    # them so they exit cleanly without needing Ctrl+C.
+    start_event.set()
+
+    # ── Step 8: Clean up Manager ──────────────────────────────
+    manager.shutdown()
 
     print("=" * 60)
     print("  Pipeline complete. All processes finished cleanly.")
@@ -242,7 +312,7 @@ def bootstrap():
 # ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # freeze_support() is required on Windows to prevent recursive
-    # subprocess spawning when the script is packaged as an executable
+    # freeze_support() prevents recursive subprocess spawning when the
+    # script is run on Windows or packaged as an executable
     multiprocessing.freeze_support()
     bootstrap()
