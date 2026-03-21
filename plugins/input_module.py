@@ -4,13 +4,8 @@ input_module.py — Input Module (Producer)
 Responsibilities (per Phase 3 PDF spec):
   1. Read the CSV from dataset_path into a DataFrame
   2. Validate that every column named in config schema_mapping exists in the CSV
-     — extra CSV columns are silently ignored
-     — missing config columns are a FATAL error (shown on Streamlit, pipeline stops)
   3. Keep only the columns mentioned in config (drop the rest)
   4. Type-cast each cell to its declared data_type
-     — if a cell cannot be cast (empty, wrong format) the ENTIRE ROW is dropped
-     — dropped-row details are stored in self.skipped_rows for Streamlit to display
-     — these row-level errors do NOT stop the pipeline
   5. Rename columns from source_name  →  internal_mapping  (generic packet keys)
   6. Add a priority_index field (1-based) to each row so Core workers can
      re-sequence out-of-order results after parallel processing (Scatter-Gather)
@@ -72,13 +67,16 @@ class InputModule:
         The bounded queue created by main.py and shared with the Core workers.
     """
 
-    def __init__(self, config: dict, raw_stream: multiprocessing.Queue):
+    def __init__(self, config: dict, raw_stream: multiprocessing.Queue,
+                 ready_event=None, start_event=None):
         self._dataset_path   = config["dataset_path"]
         self._schema_columns = config["schema_mapping"]["columns"]
         self._delay          = config["pipeline_dynamics"]["input_delay_seconds"]
         self._raw_stream     = raw_stream
+        self._ready_event    = ready_event   # fired after validation, before streaming
+        self._start_event    = start_event   # waited on before streaming starts
 
-        # Populated during run() — available for Streamlit to read
+        # Populated during run() — available for the dashboard to display
         self.skipped_rows: list[dict] = []  # non-fatal row-level type errors
         self.fatal_errors: list[str]  = []  # missing columns — pipeline must stop
 
@@ -93,11 +91,17 @@ class InputModule:
         # Step 1: load CSV (all values as raw strings — we cast ourselves)
         df = self._load_csv()
         if df is None:
+            # Fatal — signal ready so Screen 1 shows the error immediately
+            if self._ready_event is not None:
+                self._ready_event.set()
             return
 
         # Step 2: verify config columns exist, drop extras
         df = self._validate_and_select_columns(df)
         if df is None:
+            # Fatal — signal ready so Screen 1 shows the error immediately
+            if self._ready_event is not None:
+                self._ready_event.set()
             return
 
         # Step 3: cast each cell to its declared type; drop un-castable rows
@@ -112,6 +116,13 @@ class InputModule:
 
         # Step 6: convert DataFrame rows to a list of dicts (packets)
         packets = self._build_packets(df)
+
+        # Signal Screen 1 to draw NOW — validation is complete, errors are
+        # known, skipped_rows is populated. Streaming has NOT started yet
+        # so Q1 will still be visibly filling up after the button is clicked.
+        # This gives the TA time to read Screen 1 while the pipeline runs.
+        if self._ready_event is not None:
+            self._ready_event.set()
 
         # Step 7: push packets into the queue one by one
         self._stream_to_queue(packets)
@@ -269,6 +280,12 @@ class InputModule:
         - NOT pushed here. main.py pushes one None per Core worker after
           this process finishes, because only main.py knows core_parallelism.
         """
+        # Wait for Start Pipeline button
+        if self._start_event is not None:
+            print("[Input]  Waiting for Start Pipeline button...")
+            self._start_event.wait()
+            print("[Input]  Start signal received.")
+
         total = len(packets)
         print(f"[Input]  Streaming {total} packets "
               f"(delay={self._delay}s each) ...")
