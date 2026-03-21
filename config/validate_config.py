@@ -17,6 +17,33 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# Supported chart type whitelist
+#
+# Naming convention: real_time_{chart_kind}_{data_series}
+#   chart_kind  : line_graph | bar_chart | scatter
+#   data_series : values (raw metric_value) | average (computed_metric)
+#
+# The user MUST write the exact string from this set in config.json.
+# Any other string is rejected at validation time with a clear error
+# listing all valid options — before the pipeline even starts.
+#
+# To add a new chart type in future:
+#   1. Add the string here
+#   2. Add a renderer entry in output_module.py
+#   Nothing else needs to change anywhere.
+# ---------------------------------------------------------------------------
+
+SUPPORTED_CHART_TYPES = {
+    "real_time_line_graph_values",
+    "real_time_line_graph_average",
+    "real_time_bar_chart_values",
+    "real_time_bar_chart_average",
+    "real_time_scatter_values",
+    "real_time_scatter_average",
+}
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -280,7 +307,22 @@ def _check_visualizations(cfg: dict, errors: list[str]) -> None:
                     errors.append(f"{prefix} Each chart entry must be a JSON object.")
                     continue
                 for key in required_chart_keys:
-                    _require_nonempty_str(chart, key, prefix, errors)
+                    if key not in chart:
+                        errors.append(f"{prefix} Missing required key: '{key}'")
+                        continue
+                    val = chart[key]
+                    if not isinstance(val, str) or not val.strip():
+                        errors.append(
+                            f"{prefix} '{key}' must be a non-empty string. "
+                            f"Got: {repr(val)}"
+                        )
+                    # Strict whitelist check — only for the 'type' field
+                    elif key == "type" and val not in SUPPORTED_CHART_TYPES:
+                        errors.append(
+                            f"{prefix} 'type' must be one of: "
+                            f"{sorted(SUPPORTED_CHART_TYPES)}. "
+                            f"Got: {repr(val)}"
+                        )
 
 
 # ---------------------------------------------------------------------------
