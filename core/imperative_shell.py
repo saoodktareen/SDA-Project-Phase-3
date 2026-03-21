@@ -180,6 +180,7 @@ class Aggregator:
         intermediate_queue: multiprocessing.Queue,
         processed_queue: multiprocessing.Queue,
         num_workers: int,
+        start_event=None,
     ):
         """
         Parameters
@@ -200,8 +201,9 @@ class Aggregator:
         self.heap           = []                                     # min-heap (priority_index, packet)
         self.window         = collections.deque(maxlen=window_size)  # sliding window
         self.next_expected  = 1          # MUST start at 1 — InputModule priority_index is 1-based
-        self.last_seen_time = time.time()
+        self.last_seen_time = None       # reset after start_event fires
         self.sentinels_seen = 0
+        self._start_event   = start_event
 
     # ── Private helpers (Imperative Shell methods) ────────────────────────
 
@@ -245,7 +247,7 @@ class Aggregator:
         Increments next_expected by 1 and immediately calls _try_release()
         in case packets further ahead are already sitting in the heap.
         """
-        if time.time() - self.last_seen_time > CUTOFF_SECONDS:
+        if self.last_seen_time is not None and time.time() - self.last_seen_time > CUTOFF_SECONDS:
             print(f"[Aggregator] Timeout — skipping #{self.next_expected} "
                   f"(assumed dropped by worker)")
             self.next_expected  += 1
@@ -308,6 +310,13 @@ class Aggregator:
           2. Sends a None sentinel to processed_queue to signal Output
         """
         print(f"[Aggregator] Started — waiting for {self.num_workers} workers.")
+
+        # Wait for Start Pipeline button
+        if self._start_event is not None:
+            self._start_event.wait()
+
+        # Reset cutoff timer NOW
+        self.last_seen_time = time.time()
 
         while True:
             # Non-blocking poll with short timeout to allow cutoff checks
