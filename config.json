@@ -56,7 +56,31 @@
         "y_axis": "metric_value"
       },
       {
-        "type": "real_time_line_graph_average",
+        "type": "real_time_line_graph_values",
+        "title": "Live Sensor Running Average",
+        "x_axis": "time_period",
+        "y_axis": "computed_metric"
+      }, 
+      {
+        "type": "real_time_scatter_values",
+        "title": "Live Sensor Running Average",
+        "x_axis": "time_period",
+        "y_axis": "computed_metric"
+      }, 
+      {
+        "type": "real_time_scatter_average",
+        "title": "Live Sensor Running Average",
+        "x_axis": "time_period",
+        "y_axis": "computed_metric"
+      }, 
+      {
+        "type": "real_time_bar_chart_average",
+        "title": "Live Sensor Running Average",
+        "x_axis": "time_period",
+        "y_axis": "computed_metric"
+      },
+      {
+        "type": "real_time_bar_chart_values",
         "title": "Live Sensor Running Average",
         "x_axis": "time_period",
         "y_axis": "computed_metric"
