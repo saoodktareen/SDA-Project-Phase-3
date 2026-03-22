@@ -1,0 +1,56 @@
+@startuml
+
+skinparam sequenceMessageAlign center
+skinparam sequenceFontSize 12
+skinparam sequenceArrowFontSize 11
+
+participant "main.py" as Main
+participant "Input" as Input
+participant "CoreWorker" as Worker
+participant "Aggregator" as Agg
+participant "Output" as Output
+participant "Telemetry" as Tel
+
+== Init ==
+Main -> Input : spawn process
+Main -> Agg   : spawn process
+Main -> Worker : spawn N processes
+Main -> Output : spawn process
+Main -> Main   : create Q1, Q2, Q3
+
+== Validate ==
+Input -> Input : load + validate CSV
+Input -> Output : ready_event.set()
+Output -> Output : draw Screen 1
+
+== Start ==
+Output -> Main : start_event.set() [button click]
+Output -> Tel  : start telemetry thread
+Tel -> Output  : subscribe(output)
+Output -> Output : draw Screen 2
+
+== Stream (loop) ==
+loop for each packet
+  Input  -> Worker : Q1.put(packet)
+  Worker -> Worker : verify_signature()
+  Worker -> Agg    : Q2.put(priority, packet)
+  Agg    -> Agg    : heap resequence
+  Agg    -> Agg    : compute_average()
+  Agg    -> Output : Q3.put(packet)
+  Tel    -> Output : update(queue_state)
+  Output -> Output : animate charts
+end
+
+== Shutdown ==
+Input  -> Main  : input_proc.join()
+Main   -> Worker : Q1.put(None) x N
+Worker -> Agg   : sentinel → Q2.put(None)
+Worker -> Main  : worker_procs.join()
+Agg    -> Agg   : drain heap
+Agg    -> Output : Q3.put(None)
+Agg    -> Main  : aggregator_proc.join()
+Output -> Output : mark charts complete
+Output -> Main  : output_proc.join()
+Main   -> Main  : manager.shutdown()
+
+@enduml
