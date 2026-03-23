@@ -1,0 +1,78 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam classFontSize 13
+skinparam packageFontSize 11
+skinparam arrowFontSize 11
+
+package "config" {
+  class load_config {
+    + load_config(path) : dict
+  }
+  class validate_config {
+    + validate_config(cfg) : list
+  }
+}
+
+package "plugins" {
+  class InputModule {
+    + run()
+  }
+  class OutputModule {
+    + run()
+    + update(state)
+  }
+  class PipelineTelemetry {
+    + start()
+    + stop()
+    + subscribe(observer)
+  }
+  abstract class TelemetryObserver {
+    + {abstract} update(state)
+  }
+}
+
+package "core" {
+  class CoreWorker {
+    + run()
+  }
+  class Aggregator {
+    + run()
+  }
+  class functional_core <<module>> {
+    + verify_signature(packet, key, iters)
+    + compute_average(window)
+  }
+}
+
+class "multiprocessing.Queue" as Queue {
+  Q1: raw_stream
+  Q2: intermediate
+  Q3: processed
+}
+
+class "main.py" as Main {
+  + bootstrap()
+}
+
+Main --> load_config : calls
+load_config --> validate_config : calls
+Main --> InputModule : spawns
+Main --> OutputModule : spawns
+Main --> PipelineTelemetry : creates
+Main --> CoreWorker : spawns N
+Main --> Aggregator : spawns
+
+OutputModule ..|> TelemetryObserver : implements
+PipelineTelemetry --> TelemetryObserver : subscribe()
+
+CoreWorker ..> functional_core : uses
+Aggregator ..> functional_core : uses
+
+InputModule ..> Queue : Q1.put()
+CoreWorker ..> Queue : Q1.get() / Q2.put()
+Aggregator ..> Queue : Q2.get() / Q3.put()
+OutputModule ..> Queue : Q3.get()
+PipelineTelemetry ..> Queue : qsize()
+
+@enduml
