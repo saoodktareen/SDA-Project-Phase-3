@@ -1,4 +1,4 @@
-@startuml
+@startuml ClassDiagram
 
 skinparam classAttributeIconSize 0
 skinparam classFontSize 13
