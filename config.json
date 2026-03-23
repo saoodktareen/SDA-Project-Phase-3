@@ -1,33 +1,17 @@
 {
   "dataset_path": "data/sample_sensor_data.csv",
   "pipeline_dynamics": {
-    "input_delay_seconds": 0.01,
+    "input_delay_seconds": 0.02,
     "core_parallelism": 4,
     "stream_queue_max_size": 50,
     "telemetry_poll_interval": 0.2
   },
   "schema_mapping": {
     "columns": [
-      {
-        "source_name": "Sensor_ID",
-        "internal_mapping": "entity_name",
-        "data_type": "string"
-      },
-      {
-        "source_name": "Timestamp",
-        "internal_mapping": "time_period",
-        "data_type": "integer"
-      },
-      {
-        "source_name": "Raw_Value",
-        "internal_mapping": "metric_value",
-        "data_type": "float"
-      },
-      {
-        "source_name": "Auth_Signature",
-        "internal_mapping": "security_hash",
-        "data_type": "string"
-      }
+      {"source_name": "Sensor_ID",      "internal_mapping": "entity_name",  "data_type": "string"},
+      {"source_name": "Timestamp",      "internal_mapping": "time_period",  "data_type": "integer"},
+      {"source_name": "Raw_Value",      "internal_mapping": "metric_value", "data_type": "float"},
+      {"source_name": "Auth_Signature", "internal_mapping": "security_hash","data_type": "string"}
     ]
   },
   "processing": {
@@ -51,61 +35,37 @@
     "data_charts": [
       {
         "type": "real_time_line_graph_values",
-        "title": "Live Sensor Values",
+        "title": "Line — Raw Values",
         "x_axis": "time_period",
         "y_axis": "metric_value"
       },
       {
-        "type": "real_time_line_graph_values",
-        "title": "Live Sensor Running Average",
-        "x_axis": "time_period",
-        "y_axis": "computed_metric"
-      }, 
-      {
-        "type": "real_time_scatter_values",
-        "title": "Live Sensor Running Average",
-        "x_axis": "time_period",
-        "y_axis": "computed_metric"
-      }, 
-      {
-        "type": "real_time_scatter_average",
-        "title": "Live Sensor Running Average",
-        "x_axis": "time_period",
-        "y_axis": "computed_metric"
-      }, 
-      {
-        "type": "real_time_bar_chart_average",
-        "title": "Live Sensor Running Average",
+        "type": "real_time_line_graph_average",
+        "title": "Line — Running Average",
         "x_axis": "time_period",
         "y_axis": "computed_metric"
       },
       {
         "type": "real_time_bar_chart_values",
-        "title": "Live Sensor Running Average",
+        "title": "Bar — Raw Values",
         "x_axis": "time_period",
-        "y_axis": "computed_metric"
-      }, 
+        "y_axis": "metric_value"
+      },
       {
-        "type": "real_time_scatter_values",
-        "title": "Live Sensor Running Values",
-        "x_axis": "time_period",
-        "y_axis": "computed_metric"
-      }, 
-      {
-        "type": "real_time_scatter_average",
-        "title": "Live Sensor Running Average",
-        "x_axis": "time_period",
-        "y_axis": "computed_metric"
-      }, 
-      {
-        "type": "real_time_bar_chart_values",
-        "title": "Live Sensor Running Values",
+        "type": "real_time_bar_chart_average",
+        "title": "Bar — Running Average",
         "x_axis": "time_period",
         "y_axis": "computed_metric"
       },
       {
-        "type": "real_time_bar_chart_average",
-        "title": "Live Sensor Running Average",
+        "type": "real_time_scatter_values",
+        "title": "Scatter — Raw Values",
+        "x_axis": "time_period",
+        "y_axis": "metric_value"
+      },
+      {
+        "type": "real_time_scatter_average",
+        "title": "Scatter — Running Average",
         "x_axis": "time_period",
         "y_axis": "computed_metric"
       }

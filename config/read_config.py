@@ -31,8 +31,10 @@ def load_config(path: str = "config.json") -> dict:
     errors = validate_config(config)
     if errors:
         print("[Config] ERROR - config.json failed validation:")
-        for err in errors:
-            print(f"         {err}")
+        # map() applies the print function to every error string —
+        # functional replacement for: for err in errors: print(...)
+        # list() forces evaluation since map() is lazy in Python 3
+        list(map(lambda err: print(f"         {err}"), errors))
         sys.exit(1)
 
     print(f"[Config] Loaded and validated: '{path}'")

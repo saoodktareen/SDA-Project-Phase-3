@@ -26,6 +26,8 @@ Color coding thresholds:
    Green  → fill ratio < 0.40   (queue flowing smoothly)
    Yellow → fill ratio 0.40–0.75 (queue filling up, watch out)
    Red    → fill ratio > 0.75   (heavy backpressure)
+
+All iteration uses functional programming — map() — instead of for loops.
 """
 
 import time
@@ -159,10 +161,6 @@ class PipelineTelemetry:
 
     def __init__(
         self,
-        # *** CHANGE 1 ***
-        # Renamed: raw_queue -> raw_stream
-        # Matches the naming used in input_module.py and main.py,
-        # where Queue 1 is consistently called raw_stream throughout.
         raw_stream,
         intermediate_queue,
         processed_queue,
@@ -177,16 +175,13 @@ class PipelineTelemetry:
             queue_max_size     : max size for all queues (from config)
             config             : full config.json dict (for show_* flags)
         """
-        # *** CHANGE 2 ***
-        # Renamed: self._raw_queue -> self._raw_stream
-        # Keeps internal naming consistent with the constructor parameter
-        # and with how the queue is named everywhere else in the project.
         self._raw_stream         = raw_stream
         self._intermediate_queue = intermediate_queue
         self._processed_queue    = processed_queue
         self._queue_max_size     = queue_max_size
         self._telemetry_config   = config["visualizations"]["telemetry"]
-        self._poll_interval      = config["pipeline_dynamics"].get("telemetry_poll_interval", 0.2)
+        self._poll_interval      = config["pipeline_dynamics"].get(
+                                       "telemetry_poll_interval", 0.2)
 
         self._observers: list = []
         self._running         = False
@@ -198,12 +193,7 @@ class PipelineTelemetry:
     # ── Observer registration ─────────────────────────────────
 
     def subscribe(self, observer: TelemetryObserver) -> None:
-        """
-        Register an observer to receive telemetry updates.
-
-        Args:
-            observer : any object implementing TelemetryObserver
-        """
+        """Register an observer to receive telemetry updates."""
         if observer not in self._observers:
             self._observers.append(observer)
             print(f"[Telemetry] Observer registered: {type(observer).__name__}")
@@ -217,12 +207,22 @@ class PipelineTelemetry:
         """
         Push the latest telemetry state to all registered observers.
         Called internally after each poll.
+
+        Functional: map() replaces:
+            for observer in self._observers:
+                try: observer.update(state)
+                except Exception as e: print(...)
         """
-        for observer in self._observers:
+        def _notify_one(observer: TelemetryObserver) -> None:
+            """Pure action — notifies one observer, swallows exceptions."""
             try:
                 observer.update(state)
             except Exception as e:
                 print(f"[Telemetry] Observer update error: {e}")
+
+        # map() applies _notify_one to every registered observer.
+        # list() forces evaluation since map() is lazy in Python 3.
+        list(map(_notify_one, self._observers))
 
     # ── Polling loop ──────────────────────────────────────────
 
@@ -234,17 +234,20 @@ class PipelineTelemetry:
           1. Reads qsize() from all three queues
           2. Builds telemetry state (only for streams enabled in config)
           3. Stores in self.latest_state
-          4. Notifies all observers
+          4. Notifies all observers via _notify_all()
           5. Sleeps poll_interval seconds
         """
         while self._running:
             try:
-                # *** CHANGE 3 ***
-                # Updated: self._raw_queue -> self._raw_stream
-                # Matches the renamed attribute from CHANGE 2 above.
-                q1_size = self._raw_stream.qsize()         if self._telemetry_config.get("show_raw_stream", True)          else 0
-                q2_size = self._intermediate_queue.qsize() if self._telemetry_config.get("show_intermediate_stream", True) else 0
-                q3_size = self._processed_queue.qsize()    if self._telemetry_config.get("show_processed_stream", True)    else 0
+                q1_size = (self._raw_stream.qsize()
+                           if self._telemetry_config.get("show_raw_stream", True)
+                           else 0)
+                q2_size = (self._intermediate_queue.qsize()
+                           if self._telemetry_config.get("show_intermediate_stream", True)
+                           else 0)
+                q3_size = (self._processed_queue.qsize()
+                           if self._telemetry_config.get("show_processed_stream", True)
+                           else 0)
 
                 state = build_telemetry_state(
                     q1_size, self._queue_max_size,

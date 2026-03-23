@@ -12,6 +12,9 @@ Responsibilities (per Phase 3 PDF spec):
   7. Convert each row into a packet (dict) and push into the raw_stream Queue
      — respects input_delay_seconds between pushes to create controllable backpressure
 
+All iteration uses functional programming — map(), filter(), reduce(),
+and list comprehensions — instead of imperative for loops.
+
 DIP compliance:
   - InputModule depends only on the config dict (abstract data) and a
     multiprocessing.Queue (abstract channel). It knows nothing about
@@ -22,6 +25,7 @@ DIP compliance:
 
 import time
 import multiprocessing
+from functools import reduce
 import pandas as pd
 
 
@@ -61,10 +65,10 @@ class InputModule:
 
     Parameters
     ----------
-    config : dict
-        The fully validated config dict from load_config().
-    raw_stream : multiprocessing.Queue
-        The bounded queue created by main.py and shared with the Core workers.
+    config      : dict                  — fully validated config from load_config()
+    raw_stream  : multiprocessing.Queue — bounded queue shared with Core workers
+    ready_event : multiprocessing.Event — fired after validation, before streaming
+    start_event : multiprocessing.Event — waited on before streaming starts
     """
 
     def __init__(self, config: dict, raw_stream: multiprocessing.Queue,
@@ -88,43 +92,28 @@ class InputModule:
           load CSV -> validate columns -> cast -> rename -> add priority_index
           -> build packet list -> push to queue
         """
-        # Step 1: load CSV (all values as raw strings — we cast ourselves)
         df = self._load_csv()
         if df is None:
-            # Fatal — signal ready so Screen 1 shows the error immediately
             if self._ready_event is not None:
                 self._ready_event.set()
             return
 
-        # Step 2: verify config columns exist, drop extras
         df = self._validate_and_select_columns(df)
         if df is None:
-            # Fatal — signal ready so Screen 1 shows the error immediately
             if self._ready_event is not None:
                 self._ready_event.set()
             return
 
-        # Step 3: cast each cell to its declared type; drop un-castable rows
-        # Returns a NEW DataFrame with correct Python types (not string dtype)
         df = self._cast_and_clean(df)
-
-        # Step 4: rename source_name -> internal_mapping
         df = self._apply_internal_mapping(df)
-
-        # Step 5: add priority_index (1-based) for Core re-sequencing
         df = self._add_priority_index(df)
-
-        # Step 6: convert DataFrame rows to a list of dicts (packets)
         packets = self._build_packets(df)
 
-        # Signal Screen 1 to draw NOW — validation is complete, errors are
-        # known, skipped_rows is populated. Streaming has NOT started yet
-        # so Q1 will still be visibly filling up after the button is clicked.
-        # This gives the TA time to read Screen 1 while the pipeline runs.
+        # Signal Screen 1 to draw — validation done, skipped_rows populated.
+        # Streaming has NOT started yet so Q1 will visibly fill after button click.
         if self._ready_event is not None:
             self._ready_event.set()
 
-        # Step 7: push packets into the queue one by one
         self._stream_to_queue(packets)
 
     # ── Private steps ────────────────────────────────────────────────────────
@@ -152,17 +141,29 @@ class InputModule:
         Check every source_name in config exists in the CSV.
         Extra CSV columns are silently dropped.
         Missing config columns are FATAL — returns None.
+
+        Functional: filter() finds missing columns instead of a for loop.
         """
         csv_columns    = set(df.columns)
-        config_columns = [col["source_name"] for col in self._schema_columns]
+        # map() extracts source_name from every schema column — replaces list comprehension
+        config_columns = list(map(lambda col: col["source_name"], self._schema_columns))
 
-        missing = [c for c in config_columns if c not in csv_columns]
+        # filter() replaces: for c in config_columns: if c not in csv_columns
+        missing = list(filter(lambda c: c not in csv_columns, config_columns))
+
         if missing:
-            for col in missing:
-                msg = (f"[Input] FATAL — Column '{col}' declared in config "
-                       f"schema_mapping but missing from CSV.")
-                self.fatal_errors.append(msg)
-                print(msg)
+            # map() builds error messages for every missing column,
+            # list() forces evaluation, extend() appends them all at once
+            new_errors = list(map(
+                lambda col: (
+                    f"[Input] FATAL — Column '{col}' declared in config "
+                    f"schema_mapping but missing from CSV."
+                ),
+                missing
+            ))
+            # map() also prints each error as a side effect
+            list(map(print, new_errors))
+            self.fatal_errors.extend(new_errors)
             return None
 
         extra = csv_columns - set(config_columns)
@@ -177,45 +178,78 @@ class InputModule:
         Any row with even one un-castable cell is dropped entirely and logged
         in self.skipped_rows (non-fatal — pipeline continues).
 
-        Builds and returns a BRAND NEW DataFrame with native Python types
-        (int, float, str) instead of writing back into the all-string source df.
-        This avoids pandas dtype conflicts when storing int/float into str columns.
+        Functional replacement for the nested for loops:
+          - _cast_one_row() is a pure function applied via map() to every row
+          - filter() separates clean rows from skipped rows
+          - reduce() is not needed — map + filter is sufficient here
         """
-        clean_rows = []   # list of fully-cast row dicts — becomes the new DataFrame
+        # map() extracts source_name from every schema column — replaces list comprehension
+        col_names = list(map(lambda col: col["source_name"], self._schema_columns))
 
-        col_names = [col["source_name"] for col in self._schema_columns]
+        def _cast_one_cell(row: pd.Series, col_cfg: dict) -> tuple:
+            """
+            Pure function — attempts to cast one cell.
+            Returns (src_name, casted_value, True) on success,
+                    (src_name, raw_value,    False) on failure.
+            """
+            src_name  = col_cfg["source_name"]
+            data_type = col_cfg["data_type"]
+            raw_value = row[src_name]
+            casted, ok = _try_cast(raw_value, data_type)
+            return (src_name, casted if ok else raw_value, ok)
 
-        for row_idx, row in df.iterrows():
-            row_ok   = True
-            cast_row = {}
+        def _cast_one_row(indexed_row: tuple) -> dict | None:
+            """
+            Pure function — casts every cell in one row using map().
 
-            for col_cfg in self._schema_columns:
-                src_name  = col_cfg["source_name"]
-                data_type = col_cfg["data_type"]
-                raw_value = row[src_name]
+            Returns a clean dict  {col_name: cast_value, ...}  on full success.
+            Returns None if any cell fails to cast (row is skipped).
 
-                casted, ok = _try_cast(raw_value, data_type)
+            Replaces the inner for loop:
+              for col_cfg in self._schema_columns: ...
+            """
+            row_idx, row = indexed_row
 
-                if not ok:
-                    self.skipped_rows.append({
-                        "row_index": row_idx,
-                        "column":    src_name,
-                        "raw_value": raw_value,
-                        "reason":    f"Cannot cast '{raw_value}' to {data_type}",
-                    })
-                    row_ok = False
-                    break
+            # map() applies _cast_one_cell to every column config
+            cast_results = list(map(
+                lambda col_cfg: _cast_one_cell(row, col_cfg),
+                self._schema_columns
+            ))
 
-                cast_row[src_name] = casted
+            # Find the first failed cell (if any) using filter()
+            failures = list(filter(lambda r: not r[2], cast_results))
 
-            if row_ok:
-                clean_rows.append(cast_row)
+            if failures:
+                # Record skipped row for the dashboard using the first failure
+                src_name, raw_value, _ = failures[0]
+                # filter() finds the matching column, next() takes the first result
+                data_type = next(iter(filter(
+                    lambda c: c["source_name"] == src_name,
+                    self._schema_columns
+                )))["data_type"]
+                self.skipped_rows.append({
+                    "row_index": row_idx,
+                    "column":    src_name,
+                    "raw_value": raw_value,
+                    "reason":    f"Cannot cast '{raw_value}' to {data_type}",
+                })
+                return None   # signals this row should be dropped
+
+            # All cells cast successfully — build the clean row dict
+            # dict() + map() builds the clean row dict — replaces dict comprehension
+            return dict(map(lambda r: (r[0], r[1]), cast_results))
+
+        # map() applies _cast_one_row to every (index, row) pair,
+        # filter() removes None entries (the skipped rows)
+        clean_rows = list(filter(
+            lambda r: r is not None,
+            map(_cast_one_row, df.iterrows())
+        ))
 
         if self.skipped_rows:
             print(f"[Input]  Skipped {len(self.skipped_rows)} row(s) — "
                   f"type-cast failures.")
 
-        # Build a fresh DataFrame from clean rows — correct native types throughout
         clean_df = pd.DataFrame(clean_rows, columns=col_names)
         print(f"[Input]  {len(clean_df)} rows passed type validation.")
         return clean_df
@@ -226,23 +260,20 @@ class InputModule:
         After this step the DataFrame has only generic internal names.
         Core has zero knowledge of original CSV column names.
         """
-        rename_map = {
-            col["source_name"]: col["internal_mapping"]
-            for col in self._schema_columns
-        }
+        # dict() + map() builds the rename mapping — replaces dict comprehension
+        rename_map = dict(map(
+            lambda col: (col["source_name"], col["internal_mapping"]),
+            self._schema_columns
+        ))
         df = df.rename(columns=rename_map)
         print(f"[Input]  Internal mapping applied: {rename_map}")
         return df
 
     def _add_priority_index(self, df) -> pd.DataFrame:
         """
-        Insert a 'priority_index' column as the FIRST column.
-        Values are 1-based integers (1, 2, 3, ..., N).
-
-        Purpose: after the Scatter-Gather pattern scatters packets across
-        multiple Core workers in parallel, results arrive out of order.
-        The Core Aggregator uses priority_index to re-sequence them back
-        into the original order before computing the running average.
+        Insert a 'priority_index' column as the FIRST column (1-based).
+        Used by the Aggregator to re-sequence out-of-order packets
+        after the Scatter-Gather pattern.
         """
         df.insert(0, "priority_index", range(1, len(df) + 1))
         print(f"[Input]  priority_index added (1 to {len(df)}).")
@@ -251,10 +282,9 @@ class InputModule:
     def _build_packets(self, df) -> list[dict]:
         """
         Convert the validated, mapped, indexed DataFrame into a list of dicts.
-        Each dict is one self-contained data packet that the Core workers
-        will receive from the queue.
+        Each dict is one self-contained data packet for the Core workers.
 
-        Example packet (with our sensor dataset):
+        Example packet:
         {
             "priority_index": 1,
             "entity_name":    "Sensor_Alpha",
@@ -272,15 +302,17 @@ class InputModule:
         Push each packet into the raw_stream Queue one by one.
 
         Backpressure:
-        - Queue.put() BLOCKS automatically when the queue is full.
-        - time.sleep(input_delay_seconds) controls production rate.
-        - Together they throttle Input naturally — no extra code needed.
+          Queue.put() BLOCKS automatically when the queue is full.
+          time.sleep(input_delay_seconds) controls production rate.
+          Together they throttle Input naturally — no extra code needed.
+
+        Functional: map() replaces the for loop over packets.
+        The lambda pushes one packet then sleeps — applied to every packet.
 
         Sentinels:
-        - NOT pushed here. main.py pushes one None per Core worker after
+          NOT pushed here. main.py pushes one None per Core worker after
           this process finishes, because only main.py knows core_parallelism.
         """
-        # Wait for Start Pipeline button
         if self._start_event is not None:
             print("[Input]  Waiting for Start Pipeline button...")
             self._start_event.wait()
@@ -290,8 +322,13 @@ class InputModule:
         print(f"[Input]  Streaming {total} packets "
               f"(delay={self._delay}s each) ...")
 
-        for packet in packets:
-            self._raw_stream.put(packet)   # blocks if queue is full → backpressure
+        def _push_one(packet: dict) -> None:
+            """Pure action — push one packet then sleep."""
+            self._raw_stream.put(packet)   # blocks if queue full → backpressure
             time.sleep(self._delay)
+
+        # map() applies _push_one to every packet — replaces the for loop.
+        # list() forces evaluation since map() is lazy in Python 3.
+        list(map(_push_one, packets))
 
         print(f"[Input]  Done — all {total} packets pushed to raw_stream.")

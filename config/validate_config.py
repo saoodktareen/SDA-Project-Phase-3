@@ -8,29 +8,20 @@ Usage:
 
     errors = validate_config(config_dict)
     if errors:
-        # show errors via Streamlit and terminate
+        # show errors on dashboard and terminate
     else:
         # proceed with pipeline
+
+All validation uses functional programming — map(), filter(), reduce(),
+and list comprehensions — instead of imperative for loops.
 """
 
 from typing import Any
+from functools import reduce
 
 
 # ---------------------------------------------------------------------------
 # Supported chart type whitelist
-#
-# Naming convention: real_time_{chart_kind}_{data_series}
-#   chart_kind  : line_graph | bar_chart | scatter
-#   data_series : values (raw metric_value) | average (computed_metric)
-#
-# The user MUST write the exact string from this set in config.json.
-# Any other string is rejected at validation time with a clear error
-# listing all valid options — before the pipeline even starts.
-#
-# To add a new chart type in future:
-#   1. Add the string here
-#   2. Add a renderer entry in output_module.py
-#   Nothing else needs to change anywhere.
 # ---------------------------------------------------------------------------
 
 SUPPORTED_CHART_TYPES = {
@@ -41,6 +32,31 @@ SUPPORTED_CHART_TYPES = {
     "real_time_scatter_values",
     "real_time_scatter_average",
 }
+
+
+# ---------------------------------------------------------------------------
+# Utility — pure function variant (returns error string or None)
+# ---------------------------------------------------------------------------
+
+def _require_nonempty_str_result(obj: dict, key: str, prefix: str) -> str | None:
+    """
+    Pure function — returns an error string if key is absent or not a
+    non-empty string. Returns None if valid.
+    Used with filter(None, map(...)) to collect errors without a for loop.
+    """
+    if key not in obj:
+        return f"{prefix} Missing required key: '{key}'"
+    val = obj[key]
+    if not isinstance(val, str) or not val.strip():
+        return f"{prefix} '{key}' must be a non-empty string. Got: {repr(val)}"
+    return None
+
+
+def _require_nonempty_str(obj: dict, key: str, prefix: str, errors: list[str]) -> None:
+    """Side-effect variant — appends to errors list. Delegates to pure variant."""
+    result = _require_nonempty_str_result(obj, key, prefix)
+    if result:
+        errors.append(result)
 
 
 # ---------------------------------------------------------------------------
@@ -56,15 +72,18 @@ def _check_top_level_keys(cfg: dict, errors: list[str]) -> None:
         "processing",
         "visualizations",
     ]
-    for key in required_top_keys:
-        if key not in cfg:
-            errors.append(f"[TOP-LEVEL] Missing required key: '{key}'")
+    # filter() keeps only missing keys, map() formats them as error messages
+    errors.extend(filter(None, map(
+        lambda key: f"[TOP-LEVEL] Missing required key: '{key}'"
+                    if key not in cfg else None,
+        required_top_keys
+    )))
 
 
 def _check_dataset_path(cfg: dict, errors: list[str]) -> None:
     """dataset_path must be a non-empty string."""
     if "dataset_path" not in cfg:
-        return  # already caught above
+        return
     val = cfg["dataset_path"]
     if not isinstance(val, str) or not val.strip():
         errors.append(
@@ -76,13 +95,12 @@ def _check_dataset_path(cfg: dict, errors: list[str]) -> None:
 def _check_pipeline_dynamics(cfg: dict, errors: list[str]) -> None:
     """
     pipeline_dynamics must contain:
-        input_delay_seconds   – float / int  (>= 0)
-        core_parallelism      – int          (>= 1)
-        stream_queue_max_size – int          (>= 1)
-        telemetry_poll_interval – float / int (>= 0)
+        input_delay_seconds     – float / int  (>= 0)
+        core_parallelism        – int          (>= 1)
+        stream_queue_max_size   – int          (>= 1)
     """
     if "pipeline_dynamics" not in cfg:
-        return  # already caught above
+        return
 
     pd_cfg = cfg["pipeline_dynamics"]
 
@@ -91,36 +109,32 @@ def _check_pipeline_dynamics(cfg: dict, errors: list[str]) -> None:
         return
 
     required = {
-        "input_delay_seconds": (float, int),
-        "core_parallelism": (int,),
-        "stream_queue_max_size": (int,),
-        "telemetry_poll_interval": (float, int),
+        "input_delay_seconds":     (float, int),
+        "core_parallelism":        (int,),
+        "stream_queue_max_size":   (int,),
     }
 
-    for key, expected_types in required.items():
+    def _check_one_key(item: tuple) -> list[str]:
+        """Pure function — validates one pipeline_dynamics key. Returns list of errors."""
+        key, expected_types = item
         if key not in pd_cfg:
-            errors.append(f"[pipeline_dynamics] Missing required key: '{key}'")
-            continue
-
+            return [f"[pipeline_dynamics] Missing required key: '{key}'"]
         val = pd_cfg[key]
-        # booleans are a subclass of int in Python – reject them explicitly
         if isinstance(val, bool) or not isinstance(val, expected_types):
-            errors.append(
-                f"[pipeline_dynamics] '{key}' must be of type "
-                f"{' or '.join(t.__name__ for t in expected_types)}. "
-                f"Got: {repr(val)}"
-            )
-            continue
-
-        # range checks
+            type_names = " or ".join(t.__name__ for t in expected_types)
+            return [f"[pipeline_dynamics] '{key}' must be of type {type_names}. Got: {repr(val)}"]
         if key in ("core_parallelism", "stream_queue_max_size") and val < 1:
-            errors.append(
-                f"[pipeline_dynamics] '{key}' must be >= 1. Got: {val}"
-            )
-        elif key in ("input_delay_seconds", "telemetry_poll_interval") and val < 0:
-            errors.append(
-                f"[pipeline_dynamics] '{key}' must be >= 0. Got: {val}"
-            )
+            return [f"[pipeline_dynamics] '{key}' must be >= 1. Got: {val}"]
+        if key in ("input_delay_seconds") and val < 0:
+            return [f"[pipeline_dynamics] '{key}' must be >= 0. Got: {val}"]
+        return []
+
+    # map() validates each key, reduce() flattens all per-key error lists
+    errors.extend(reduce(
+        lambda acc, lst: acc + lst,
+        map(_check_one_key, required.items()),
+        []
+    ))
 
 
 def _check_schema_mapping(cfg: dict, errors: list[str]) -> None:
@@ -151,43 +165,45 @@ def _check_schema_mapping(cfg: dict, errors: list[str]) -> None:
         return
 
     allowed_data_types = {"string", "integer", "float"}
-    required_col_keys = ["source_name", "internal_mapping", "data_type"]
+    required_col_keys  = ["source_name", "internal_mapping", "data_type"]
 
-    for idx, col in enumerate(columns):
+    def _check_col_key(prefix: str, col: dict, key: str) -> list[str]:
+        """Pure function — validates one key inside one column entry."""
+        if key not in col:
+            return [f"{prefix} Missing required key: '{key}'"]
+        val = col[key]
+        if not isinstance(val, str) or not val.strip():
+            return [f"{prefix} '{key}' must be a non-empty string. Got: {repr(val)}"]
+        if key == "data_type" and val not in allowed_data_types:
+            return [f"{prefix} 'data_type' must be one of {sorted(allowed_data_types)}. Got: {repr(val)}"]
+        return []
+
+    def _check_one_column(item: tuple) -> list[str]:
+        """Pure function — validates one column entry (idx, col dict)."""
+        idx, col = item
         prefix = f"[schema_mapping.columns[{idx}]]"
-
         if not isinstance(col, dict):
-            errors.append(f"{prefix} Each column entry must be a JSON object.")
-            continue
+            return [f"{prefix} Each column entry must be a JSON object."]
+        # map() checks every required key, reduce() flattens results
+        return reduce(
+            lambda acc, lst: acc + lst,
+            map(lambda key: _check_col_key(prefix, col, key), required_col_keys),
+            []
+        )
 
-        for key in required_col_keys:
-            if key not in col:
-                errors.append(f"{prefix} Missing required key: '{key}'")
-                continue
-
-            val = col[key]
-            if not isinstance(val, str) or not val.strip():
-                errors.append(
-                    f"{prefix} '{key}' must be a non-empty string. Got: {repr(val)}"
-                )
-            elif key == "data_type" and val not in allowed_data_types:
-                errors.append(
-                    f"{prefix} 'data_type' must be one of "
-                    f"{sorted(allowed_data_types)}. Got: {repr(val)}"
-                )
+    # map() validates every column, reduce() flattens all error lists
+    errors.extend(reduce(
+        lambda acc, lst: acc + lst,
+        map(_check_one_column, enumerate(columns)),
+        []
+    ))
 
 
 def _check_processing(cfg: dict, errors: list[str]) -> None:
     """
     processing must contain:
-        stateless_tasks:
-            operation   – non-empty string
-            algorithm   – non-empty string
-            iterations  – int (>= 1)
-            secret_key  – non-empty string
-        stateful_tasks:
-            operation                  – non-empty string
-            running_average_window_size – int (>= 1)
+        stateless_tasks: operation, algorithm, iterations, secret_key
+        stateful_tasks:  operation, running_average_window_size
     """
     if "processing" not in cfg:
         return
@@ -206,23 +222,19 @@ def _check_processing(cfg: dict, errors: list[str]) -> None:
         if not isinstance(st, dict):
             errors.append("[processing.stateless_tasks] Must be a JSON object (dict).")
         else:
-            _require_nonempty_str(st, "operation",  "[processing.stateless_tasks]", errors)
-            _require_nonempty_str(st, "algorithm",  "[processing.stateless_tasks]", errors)
-            _require_nonempty_str(st, "secret_key", "[processing.stateless_tasks]", errors)
-
+            # map() checks each string field, filter() removes None (valid) results
+            errors.extend(filter(None, map(
+                lambda key: _require_nonempty_str_result(st, key, "[processing.stateless_tasks]"),
+                ["operation", "algorithm", "secret_key"]
+            )))
             if "iterations" not in st:
                 errors.append("[processing.stateless_tasks] Missing required key: 'iterations'")
             else:
                 val = st["iterations"]
                 if isinstance(val, bool) or not isinstance(val, int):
-                    errors.append(
-                        "[processing.stateless_tasks] 'iterations' must be an integer. "
-                        f"Got: {repr(val)}"
-                    )
+                    errors.append(f"[processing.stateless_tasks] 'iterations' must be an integer. Got: {repr(val)}")
                 elif val < 1:
-                    errors.append(
-                        f"[processing.stateless_tasks] 'iterations' must be >= 1. Got: {val}"
-                    )
+                    errors.append(f"[processing.stateless_tasks] 'iterations' must be >= 1. Got: {val}")
 
     # --- stateful_tasks ---
     if "stateful_tasks" not in proc:
@@ -232,39 +244,25 @@ def _check_processing(cfg: dict, errors: list[str]) -> None:
         if not isinstance(sft, dict):
             errors.append("[processing.stateful_tasks] Must be a JSON object (dict).")
         else:
-            _require_nonempty_str(sft, "operation", "[processing.stateful_tasks]", errors)
-
+            errors.extend(filter(None, map(
+                lambda key: _require_nonempty_str_result(sft, key, "[processing.stateful_tasks]"),
+                ["operation"]
+            )))
             if "running_average_window_size" not in sft:
-                errors.append(
-                    "[processing.stateful_tasks] Missing required key: "
-                    "'running_average_window_size'"
-                )
+                errors.append("[processing.stateful_tasks] Missing required key: 'running_average_window_size'")
             else:
                 val = sft["running_average_window_size"]
                 if isinstance(val, bool) or not isinstance(val, int):
-                    errors.append(
-                        "[processing.stateful_tasks] 'running_average_window_size' "
-                        f"must be an integer. Got: {repr(val)}"
-                    )
+                    errors.append(f"[processing.stateful_tasks] 'running_average_window_size' must be an integer. Got: {repr(val)}")
                 elif val < 1:
-                    errors.append(
-                        "[processing.stateful_tasks] 'running_average_window_size' "
-                        f"must be >= 1. Got: {val}"
-                    )
+                    errors.append(f"[processing.stateful_tasks] 'running_average_window_size' must be >= 1. Got: {val}")
 
 
 def _check_visualizations(cfg: dict, errors: list[str]) -> None:
     """
     visualizations must contain:
-        telemetry:
-            show_raw_stream          – bool
-            show_intermediate_stream – bool
-            show_processed_stream    – bool
-        data_charts – non-empty list, each item having:
-            type   – non-empty string
-            title  – non-empty string
-            x_axis – non-empty string
-            y_axis – non-empty string
+        telemetry: show_raw_stream, show_intermediate_stream, show_processed_stream
+        data_charts: non-empty list of chart dicts with type, title, x_axis, y_axis
     """
     if "visualizations" not in cfg:
         return
@@ -283,14 +281,26 @@ def _check_visualizations(cfg: dict, errors: list[str]) -> None:
         if not isinstance(tel, dict):
             errors.append("[visualizations.telemetry] Must be a JSON object (dict).")
         else:
-            for flag in ("show_raw_stream", "show_intermediate_stream", "show_processed_stream"):
+            telemetry_flags = (
+                "show_raw_stream",
+                "show_intermediate_stream",
+                "show_processed_stream",
+            )
+
+            def _check_flag(flag: str) -> list[str]:
+                """Pure function — validates one telemetry boolean flag."""
                 if flag not in tel:
-                    errors.append(f"[visualizations.telemetry] Missing required key: '{flag}'")
-                elif not isinstance(tel[flag], bool):
-                    errors.append(
-                        f"[visualizations.telemetry] '{flag}' must be a boolean "
-                        f"(true/false). Got: {repr(tel[flag])}"
-                    )
+                    return [f"[visualizations.telemetry] Missing required key: '{flag}'"]
+                if not isinstance(tel[flag], bool):
+                    return [f"[visualizations.telemetry] '{flag}' must be a boolean (true/false). Got: {repr(tel[flag])}"]
+                return []
+
+            # map() checks every flag, reduce() flattens the results
+            errors.extend(reduce(
+                lambda acc, lst: acc + lst,
+                map(_check_flag, telemetry_flags),
+                []
+            ))
 
     # --- data_charts ---
     if "data_charts" not in viz:
@@ -301,46 +311,37 @@ def _check_visualizations(cfg: dict, errors: list[str]) -> None:
             errors.append("[visualizations] 'data_charts' must be a non-empty list.")
         else:
             required_chart_keys = ["type", "title", "x_axis", "y_axis"]
-            for idx, chart in enumerate(charts):
+
+            def _check_chart_key(prefix: str, chart: dict, key: str) -> list[str]:
+                """Pure function — validates one key in one chart entry."""
+                if key not in chart:
+                    return [f"{prefix} Missing required key: '{key}'"]
+                val = chart[key]
+                if not isinstance(val, str) or not val.strip():
+                    return [f"{prefix} '{key}' must be a non-empty string. Got: {repr(val)}"]
+                if key == "type" and val not in SUPPORTED_CHART_TYPES:
+                    return [f"{prefix} 'type' must be one of: {sorted(SUPPORTED_CHART_TYPES)}. Got: {repr(val)}"]
+                return []
+
+            def _check_one_chart(item: tuple) -> list[str]:
+                """Pure function — validates one chart entry (idx, chart dict)."""
+                idx, chart = item
                 prefix = f"[visualizations.data_charts[{idx}]]"
                 if not isinstance(chart, dict):
-                    errors.append(f"{prefix} Each chart entry must be a JSON object.")
-                    continue
-                for key in required_chart_keys:
-                    if key not in chart:
-                        errors.append(f"{prefix} Missing required key: '{key}'")
-                        continue
-                    val = chart[key]
-                    if not isinstance(val, str) or not val.strip():
-                        errors.append(
-                            f"{prefix} '{key}' must be a non-empty string. "
-                            f"Got: {repr(val)}"
-                        )
-                    # Strict whitelist check — only for the 'type' field
-                    elif key == "type" and val not in SUPPORTED_CHART_TYPES:
-                        errors.append(
-                            f"{prefix} 'type' must be one of: "
-                            f"{sorted(SUPPORTED_CHART_TYPES)}. "
-                            f"Got: {repr(val)}"
-                        )
+                    return [f"{prefix} Each chart entry must be a JSON object."]
+                # map() checks every required key, reduce() flattens results
+                return reduce(
+                    lambda acc, lst: acc + lst,
+                    map(lambda key: _check_chart_key(prefix, chart, key), required_chart_keys),
+                    []
+                )
 
-
-# ---------------------------------------------------------------------------
-# Tiny utility
-# ---------------------------------------------------------------------------
-
-def _require_nonempty_str(
-    obj: dict, key: str, prefix: str, errors: list[str]
-) -> None:
-    """Append an error if `key` is absent or not a non-empty string in `obj`."""
-    if key not in obj:
-        errors.append(f"{prefix} Missing required key: '{key}'")
-    else:
-        val = obj[key]
-        if not isinstance(val, str) or not val.strip():
-            errors.append(
-                f"{prefix} '{key}' must be a non-empty string. Got: {repr(val)}"
-            )
+            # map() validates every chart, reduce() flattens all error lists
+            errors.extend(reduce(
+                lambda acc, lst: acc + lst,
+                map(_check_one_chart, enumerate(charts)),
+                []
+            ))
 
 
 # ---------------------------------------------------------------------------
@@ -369,13 +370,20 @@ def validate_config(cfg: Any) -> list[str]:
             "[CONFIG] The configuration file must be a JSON object at the top level. "
             f"Got type: {type(cfg).__name__}"
         )
-        return errors  # nothing more can be checked
+        return errors
 
-    _check_top_level_keys(cfg, errors)
-    _check_dataset_path(cfg, errors)
-    _check_pipeline_dynamics(cfg, errors)
-    _check_schema_mapping(cfg, errors)
-    _check_processing(cfg, errors)
-    _check_visualizations(cfg, errors)
+    # map() applies every checker to (cfg, errors) — no for loop needed
+    # list() forces evaluation since map() is lazy in Python 3
+    list(map(
+        lambda checker: checker(cfg, errors),
+        [
+            _check_top_level_keys,
+            _check_dataset_path,
+            _check_pipeline_dynamics,
+            _check_schema_mapping,
+            _check_processing,
+            _check_visualizations,
+        ]
+    ))
 
     return errors
