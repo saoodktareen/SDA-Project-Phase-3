@@ -1,56 +1,90 @@
 @startuml SequenceDiagram
+title Generic Concurrent Real-Time Pipeline - Complete Sequence Diagram
 
-skinparam sequenceMessageAlign center
-skinparam sequenceFontSize 12
-skinparam sequenceArrowFontSize 11
+actor User
 
-participant "main.py" as Main
-participant "Input" as Input
-participant "CoreWorker" as Worker
-participant "Aggregator" as Agg
-participant "Output" as Output
-participant "Telemetry" as Tel
+participant Main
+participant ConfigReader
+participant ConfigValidator
+participant "Input Process\n(Input Module)" as Input
+participant "Functional Core" as FC
+participant "Raw Queue" as RawQ
+participant "Scatter Workers\n(Parallel Core)" as Scatter
+participant "Intermediate Queue" as IntQ
+participant "Gather Process\n(Aggregator)" as Gather
+participant "Processed Queue" as ProcQ
+participant "Output Dashboard" as Output
+participant "Telemetry\n(Observer Subject)" as Telemetry
 
-== Init ==
-Main -> Input : spawn process
-Main -> Agg   : spawn process
-Main -> Worker : spawn N processes
-Main -> Output : spawn process
-Main -> Main   : create Q1, Q2, Q3
+== Initialization ==
+User -> Main          : run main.py
+Main -> ConfigReader  : load_config()
+ConfigReader --> Main : config.json
+Main -> ConfigValidator : validate_config(config)
+ConfigValidator --> Main : validated config
+Main -> RawQ     : create(max_size)
+Main -> IntQ     : create(max_size)
+Main -> ProcQ    : create(max_size)
+Main -> Telemetry : initialize(queues)
+Main -> Output   : initialize()
+Telemetry -> Output : subscribe()
 
-== Validate ==
-Input -> Input : load + validate CSV
-Input -> Output : ready_event.set()
-Output -> Output : draw Screen 1
+== Process Creation ==
+Main -> Output   : start process
+Main -> Gather   : start process
+Main -> Scatter  : start N workers (core_parallelism)
+Main -> Input    : start process
+Main -> Telemetry : start monitoring thread
+Main -> Output   : run()
 
-== Start ==
-Output -> Main : start_event.set() [button click]
-Output -> Tel  : start telemetry thread
-Output -> Tel  : subscribe(output)
-Output -> Output : draw Screen 2
-
-== Stream (loop) ==
-loop for each packet
-  Input  -> Worker : Q1.put(packet)
-  Worker -> Worker : verify_signature()
-  Worker -> Agg    : Q2.put(priority, packet)
-  Agg    -> Agg    : heap resequence
-  Agg    -> Agg    : compute_average()
-  Agg    -> Output : Q3.put(packet)
-  Tel    -> Output : update(queue_state)
-  Output -> Output : animate charts
+== Data Streaming (Producer-Consumer with Backpressure) ==
+loop Continuous Stream
+    Input -> ConfigReader : get schema_mapping
+    Input -> Input        : read row + cast types
+    Input -> Input        : sleep(input_delay_seconds)
+    alt RawQ FULL (Backpressure)
+        Input -> RawQ : wait (blocked)
+    else Space Available
+        Input -> RawQ : push packet
+    end
+    par Parallel Workers
+        Scatter -> RawQ         : consume packet
+        Scatter -> ConfigReader : get secret_key
+        Scatter -> FC           : verify_signature(packet, key)
+        alt Valid Packet
+            Scatter -> IntQ : push verified packet
+        else Invalid Packet
+            Scatter -> Scatter : drop packet
+        end
+    end
+    Gather -> IntQ         : consume verified packet
+    Gather -> ConfigReader : get window size
+    Gather -> Gather       : resequence stream (if needed)
+    Gather -> FC           : compute_average(window)
+    Gather -> ProcQ        : push processed packet
+    Output -> ProcQ        : read processed data
+    Output -> Output       : update graphs (value + average)
 end
 
-== Shutdown ==
-Input  -> Main  : input_proc.join()
-Main   -> Worker : Q1.put(None) x N
-Worker -> Agg   : sentinel → Q2.put(None)
-Worker -> Main  : worker_procs.join()
-Agg    -> Agg   : drain heap
-Agg    -> Output : Q3.put(None)
-Agg    -> Main  : aggregator_proc.join()
-Output -> Output : mark charts complete
-Output -> Main  : output_proc.join()
-Main   -> Main  : manager.shutdown()
+== Telemetry Monitoring (Observer Pattern) ==
+loop Continuous Monitoring
+    Telemetry -> RawQ     : qsize()
+    Telemetry -> IntQ     : qsize()
+    Telemetry -> ProcQ    : qsize()
+    Telemetry -> Telemetry : compute queue ratios
+    Telemetry -> Output   : notify(status)
+    Output -> Output      : update colors\n(Green / Yellow / Red)
+end
+
+== Graceful Termination ==
+Input   -> RawQ    : send END signal (sentinel)
+Scatter -> RawQ    : receive END
+Scatter -> IntQ    : forward END
+Gather  -> IntQ    : receive END
+Gather  -> ProcQ   : forward END
+Output  -> ProcQ   : receive END
+Output  -> Output  : stop rendering
+User    -> Output  : close dashboard
+Output  -> Telemetry : stop monitoring
 
 @enduml

@@ -1,78 +1,141 @@
 @startuml ClassDiagram
+title Generic Concurrent Real-Time Pipeline - Class Diagram
 
-skinparam classAttributeIconSize 0
-skinparam classFontSize 13
-skinparam packageFontSize 11
-skinparam arrowFontSize 11
-
-package "config" {
-  class load_config {
-    + load_config(path) : dict
-  }
-  class validate_config {
-    + validate_config(cfg) : list
-  }
+' =========================
+' CONFIG MODULE
+' =========================
+package "CONFIG" <<Folder>> {
+    class load_config {
+        +load_config(path): dict
+    }
+    class validate_config {
+        +validate_config(cfg): list
+    }
 }
 
-package "plugins" {
-  class InputModule {
-    + run()
-  }
-  class OutputModule {
-    + run()
-    + update(state)
-  }
-  class PipelineTelemetry {
-    + start()
-    + stop()
-    + subscribe(observer)
-  }
-  abstract class TelemetryObserver {
-    + {abstract} update(state)
-  }
+' =========================
+' INPUT MODULE
+' =========================
+package "PLUGINS.INPUTS" <<Folder>> {
+    class InputModule {
+        -dataset_path: string
+        -schema_columns: list
+        -delay: float
+        -raw_stream: multiprocessing.Queue
+        -skipped_rows: list
+        -fatal_errors: list
+        +__init__(config, raw_stream, ready_event, start_event)
+        +run()
+    }
 }
 
-package "core" {
-  class CoreWorker {
-    + run()
-  }
-  class Aggregator {
-    + run()
-  }
-  class functional_core <<module>> {
-    + verify_signature(packet, key, iters)
-    + compute_average(window)
-  }
+' =========================
+' CORE MODULE
+' =========================
+package "CORE.IMPERATIVE_SHELL" <<Folder>> {
+    class CoreWorker {
+        -worker_id: int
+        -secret_key: string
+        -iterations: int
+        -raw_queue: multiprocessing.Queue
+        -intermediate_queue: multiprocessing.Queue
+        +__init__(worker_id, config, raw_queue, intermediate_queue)
+        +run()
+    }
 }
 
-class "multiprocessing.Queue" as Queue {
-  Q1: raw_stream
-  Q2: intermediate
-  Q3: processed
+package "CORE.FUNCTIONAL_CORE" <<Folder>> {
+    class Aggregator {
+        -heap: list
+        -window: deque
+        -next_expected: int
+        -intermediate_queue: multiprocessing.Queue
+        -processed_queue: multiprocessing.Queue
+        +__init__(config, intermediate_queue, processed_queue, num_workers, start_event)
+        +run()
+    }
+    class functional_core {
+        +verify_signature(packet, secret_key, iterations): bool
+        +compute_average(window): float
+    }
 }
 
-class "main.py" as Main {
-  + bootstrap()
+' =========================
+' OUTPUT MODULE
+' =========================
+package "PLUGINS.OUTPUTS" <<Folder>> {
+    class OutputModule {
+        -processed_queue: multiprocessing.Queue
+        -chart_buffers: list
+        -packets_received: int
+        -stream_done: bool
+        +__init__(config, processed_queue, error_dict, ready_event, start_event)
+        +run()
+        +update(telemetry_state)
+    }
 }
 
-Main --> load_config : calls
-load_config --> validate_config : calls
-Main --> InputModule : spawns
-Main --> OutputModule : spawns
-Main --> PipelineTelemetry : creates
-Main --> CoreWorker : spawns N
-Main --> Aggregator : spawns
+' =========================
+' TELEMETRY MODULE (Observer Pattern)
+' =========================
+package "TELEMETRY" <<Folder>> {
+    class PipelineTelemetry {
+        -raw_stream: multiprocessing.Queue
+        -intermediate_queue: multiprocessing.Queue
+        -processed_queue: multiprocessing.Queue
+        -poll_interval: float
+        -observers: list
+        +__init__(raw_stream, intermediate_queue, processed_queue, queue_max_size, config)
+        +subscribe(observer)
+        +unsubscribe(observer)
+        +start()
+        +stop()
+    }
+    interface TelemetryObserver {
+        +update(telemetry_state)
+    }
+}
 
-OutputModule ..|> TelemetryObserver : implements
-PipelineTelemetry --> TelemetryObserver : subscribe()
+' =========================
+' MAIN ORCHESTRATOR
+' =========================
+package "MAIN" <<Folder>> {
+    class main {
+        +bootstrap(): void
+    }
+}
 
-CoreWorker ..> functional_core : uses
-Aggregator ..> functional_core : uses
+' =========================
+' RELATIONSHIPS
+' =========================
 
-InputModule ..> Queue : Q1.put()
-CoreWorker ..> Queue : Q1.get() / Q2.put()
-Aggregator ..> Queue : Q2.get() / Q3.put()
-OutputModule ..> Queue : Q3.get()
-PipelineTelemetry ..> Queue : qsize()
+' Observer implementation
+OutputModule ..|> TelemetryObserver
+
+' Config usage
+main --> load_config
+load_config --> validate_config
+
+' Process spawning
+main --> InputModule     : spawns
+main --> CoreWorker      : spawns N
+main --> Aggregator      : spawns
+main --> OutputModule    : spawns
+main --> PipelineTelemetry : creates
+
+' Stream flow (Queues)
+InputModule --> CoreWorker   : raw_stream (Q1)
+CoreWorker  --> Aggregator   : intermediate_queue (Q2)
+Aggregator  --> OutputModule : processed_queue (Q3)
+
+' Core dependencies
+CoreWorker ..> functional_core : verify_signature()
+Aggregator ..> functional_core : compute_average()
+
+' Telemetry observer pattern
+PipelineTelemetry --> TelemetryObserver : notifies
+PipelineTelemetry ..> InputModule       : qsize() Q1
+PipelineTelemetry ..> Aggregator        : qsize() Q2
+PipelineTelemetry ..> OutputModule      : qsize() Q3
 
 @enduml
