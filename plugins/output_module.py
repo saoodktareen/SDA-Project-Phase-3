@@ -1,59 +1,13 @@
-"""
-output_module.py — Two-Screen Matplotlib Dashboard
-====================================================
-Screen 1 — Status Screen (shown first, always):
-  Shows pipeline status, errors, and warnings.
-  ┌──────────────────────────────────────────────┐
-  │  Phase 3 — Generic Concurrent Pipeline        │
-  │                                              │
-  │  [RED]   FATAL errors (config / CSV issues)  │
-  │    → No button shown. User closes window.    │
-  │                                              │
-  │  [BLUE]  Skipped row warnings (non-fatal)    │
-  │    → "▶  Start Pipeline" button shown.       │
-  │                                              │
-  │  [GREEN] No errors at all                    │
-  │    → "▶  Start Pipeline" button shown.       │
-  │                                              │
-  │          [ ▶  Start Pipeline ]               │  ← bottom-left button
-  └──────────────────────────────────────────────┘
-
-Screen 2 — Live Dashboard (shown after button click):
-  Processing starts when button is clicked.
-  ┌──────────────────────────────────────────────┐
-  │  [Chart 0] — from config data_charts[0]      │
-  │  [Chart 1] — from config data_charts[1]      │
-  │  ...one panel per config entry...            │
-  │  [Telemetry] Q1 / Q2 / Q3 health bars        │
-  └──────────────────────────────────────────────┘
-
-Screen size: width=12 inches, height dynamic (6 for Screen 1, up to
-8.0 for Screen 2). Fits 12/14/16-inch laptops without overflowing.
-
-All iteration uses functional programming — map(), filter(), reduce(),
-zip() with map(), and next(iter(filter())) — instead of for loops.
-
-DIP compliance:
-  OutputModule depends only on processed_queue + config + error_dict.
-  It never imports InputModule, CoreWorker, or Aggregator.
-  It implements TelemetryObserver — Subject never imports it directly.
-"""
-
 import threading
 import collections
 import multiprocessing
 from functools import reduce
-
-# ─────────────────────────────────────────────────────────────
-#  Backend auto-detection — must happen before pyplot import
-# ─────────────────────────────────────────────────────────────
 
 def _set_matplotlib_backend() -> str:
     import matplotlib
     backends = ["TkAgg", "Qt5Agg", "Qt6Agg", "WxAgg", "MacOSX", "Agg"]
 
     def _try_backend(backend: str) -> str | None:
-        """Pure function — tries one backend, returns name on success or None."""
         try:
             matplotlib.use(backend)
             import matplotlib.pyplot as plt
@@ -63,7 +17,6 @@ def _set_matplotlib_backend() -> str:
         except Exception:
             return None
 
-    # filter() keeps the first successful backend, next() picks it
     result = next(
         filter(lambda b: b is not None, map(_try_backend, backends)),
         None
@@ -75,26 +28,15 @@ def _set_matplotlib_backend() -> str:
     print("[Output] WARNING — Agg backend (no display window).")
     return "Agg"
 
-
-# Matplotlib imports are deferred inside run() — NOT at module import time.
-# On Windows multiprocessing uses "spawn" which re-imports every module in
-# every child process. Deferring to run() means it only runs once, in OutputProcess.
-
 from plugins.telemetry import TelemetryObserver
 from config.validate_config import SUPPORTED_CHART_TYPES
 
-# Filled in by _init_matplotlib() inside run() — do not use before that
 plt         = None
 animation   = None
 gridspec    = None
 Button      = None
 MaxNLocator = None
 _BACKEND    = None
-
-
-# ─────────────────────────────────────────────────────────────
-#  Color palette
-# ─────────────────────────────────────────────────────────────
 
 BG         = "#0f1117"
 PANEL      = "#1a1d27"
@@ -119,11 +61,6 @@ QUEUE_BAR_COLORS = {
 
 MAX_POINTS = 120
 
-
-# ─────────────────────────────────────────────────────────────
-#  y-axis key — driven by chart type, not config y_axis string
-# ─────────────────────────────────────────────────────────────
-
 _Y_KEY = {
     "real_time_line_graph_values":  "metric_value",
     "real_time_line_graph_average": "computed_metric",
@@ -133,20 +70,12 @@ _Y_KEY = {
     "real_time_scatter_average":    "computed_metric",
 }
 
-
-# ─────────────────────────────────────────────────────────────
-#  Window size
-# ─────────────────────────────────────────────────────────────
-
-FIGURE_WIDTH = 12   # fixed width in inches — fits 12/14/16-inch laptops
+FIGURE_WIDTH = 12
 
 def _figure_height(n_chart_rows: int) -> float:
-    """Return figure height in inches based on number of chart rows."""
     return min(2.2 * n_chart_rows + 1.8, 8.5)
 
-
 def _init_matplotlib():
-    """Import matplotlib and select backend. Called once inside run()."""
     global plt, animation, gridspec, Button, MaxNLocator, _BACKEND
     _BACKEND = _set_matplotlib_backend()
     import matplotlib.pyplot as _plt
@@ -160,18 +89,7 @@ def _init_matplotlib():
     Button      = _Btn
     MaxNLocator = _MNL
 
-
-# ─────────────────────────────────────────────────────────────
-#  OutputModule
-# ─────────────────────────────────────────────────────────────
-
 class OutputModule(TelemetryObserver):
-    """
-    Two-screen matplotlib dashboard.
-
-    Screen 1: status/error screen — always shown first.
-    Screen 2: live charts + telemetry — shown after button click.
-    """
 
     def __init__(self, config: dict,
                  processed_queue: multiprocessing.Queue,
@@ -185,7 +103,6 @@ class OutputModule(TelemetryObserver):
         self._charts_cfg      = config["visualizations"]["data_charts"]
         self._tel_cfg         = config["visualizations"]["telemetry"]
 
-        # Chart data buffers — map() replaces list comprehension with for
         self._chart_buffers: list[dict] = list(map(
             lambda chart_cfg: {
                 "x":   collections.deque(maxlen=MAX_POINTS),
@@ -209,8 +126,6 @@ class OutputModule(TelemetryObserver):
         self._scatters         = []
         self._ax_tel           = None
 
-    # ── TelemetryObserver interface ───────────────────────────
-
     def update(self, telemetry_state: dict) -> None:
         with self._tel_lock:
             self._tel_state = telemetry_state
@@ -220,10 +135,6 @@ class OutputModule(TelemetryObserver):
             return [], []
         return (list(self._error_dict.get("fatal_errors", [])),
                 list(self._error_dict.get("skipped_rows",  [])))
-
-    # ─────────────────────────────────────────────────────────
-    #  Screen 1 — Status / Error screen
-    # ─────────────────────────────────────────────────────────
 
     def _build_screen1(self) -> None:
         plt.style.use("dark_background")
@@ -300,13 +211,9 @@ class OutputModule(TelemetryObserver):
             y -= 0.10
 
             def _draw_one_error(state: tuple) -> tuple:
-                """
-                Pure function — draws one error message (possibly wrapped).
-                Takes (current_y, err_string), returns updated y after drawing.
-                """
                 current_y, err = state
                 max_chars = 90
-                # map() wraps the error into lines of max_chars length
+
                 wrapped = list(map(
                     lambda i: err[i: i + max_chars],
                     range(0, len(err), max_chars)
@@ -316,9 +223,9 @@ class OutputModule(TelemetryObserver):
                     ax.text(0.08, ly, line, va="top", color=BAR_RED,
                             fontsize=9, fontfamily="monospace")
                     return ly - 0.07
-                # reduce() draws each wrapped line and accumulates y position
-                new_y = reduce(_draw_line, wrapped, current_y)  # type: ignore
-                # fix: reduce needs (acc, item) signature
+
+                new_y = reduce(_draw_line, wrapped, current_y)
+
                 final_y = reduce(
                     lambda ly, line: (
                         ax.text(0.08, ly, line, va="top", color=BAR_RED,
@@ -329,7 +236,6 @@ class OutputModule(TelemetryObserver):
                 )
                 return final_y
 
-            # reduce() threads y through every error, drawing each one
             reduce(
                 lambda current_y, err: (
                     ax.text(0.08, current_y,
@@ -358,7 +264,6 @@ class OutputModule(TelemetryObserver):
             headers = ["Row", "Column", "Raw Value", "Reason"]
             col_x   = [0.08, 0.20, 0.40, 0.58]
 
-            # map() + zip() draws each header — replaces: for hdr, cx in zip(...)
             list(map(
                 lambda hdr_cx: ax.text(hdr_cx[1], y, hdr_cx[0], va="top",
                                        color=DIM, fontsize=9, fontweight="bold"),
@@ -369,11 +274,6 @@ class OutputModule(TelemetryObserver):
             y -= 0.01
 
             def _draw_one_skip(state: tuple) -> float:
-                """
-                Pure function — draws one skipped-row table row.
-                Takes current y, returns y after drawing.
-                Replaces: for skip in skipped[:6]: for val, cx in zip(vals, col_x)
-                """
                 current_y, skip = state
                 vals = [
                     str(skip.get("row_index", "")),
@@ -381,7 +281,7 @@ class OutputModule(TelemetryObserver):
                     str(skip.get("raw_value", ""))[:18],
                     str(skip.get("reason",    ""))[:40],
                 ]
-                # map() draws each cell in the row
+
                 list(map(
                     lambda val_cx: ax.text(val_cx[1], current_y, val_cx[0],
                                            va="top", color=AMBER, fontsize=8,
@@ -390,8 +290,6 @@ class OutputModule(TelemetryObserver):
                 ))
                 return current_y - 0.06
 
-            # reduce() threads y through every skipped row
-            # map() pairs each skip with the current y — no list comprehension
             y = reduce(_draw_one_skip, list(map(lambda s: (y, s), skipped[:6])), y)
 
             if len(skipped) > 6:
@@ -404,10 +302,6 @@ class OutputModule(TelemetryObserver):
             self._btn.ax.set_visible(True)
 
         self._fig.canvas.draw_idle()
-
-    # ─────────────────────────────────────────────────────────
-    #  Button callback — switch to Screen 2
-    # ─────────────────────────────────────────────────────────
 
     def _on_start_clicked(self, event) -> None:
         self._pipeline_started = True
@@ -426,17 +320,7 @@ class OutputModule(TelemetryObserver):
         )
         self._fig.canvas.draw_idle()
 
-    # ─────────────────────────────────────────────────────────
-    #  Screen 2 — Live charts + telemetry
-    # ─────────────────────────────────────────────────────────
-
     def _build_screen2(self) -> None:
-        """
-        Adaptive grid layout.
-        1-2 charts → 1 column. 3+ charts → 2 columns.
-        Telemetry always spans full width at bottom.
-        map() replaces the for loop that built each chart axes.
-        """
         self._fig.set_facecolor(BG)
         self._fig.clear()
 
@@ -452,7 +336,7 @@ class OutputModule(TelemetryObserver):
 
         n_charts = len(self._charts_cfg)
         n_cols   = 1 if n_charts <= 2 else 2
-        n_rows   = -(-n_charts // n_cols)   # ceiling division
+        n_rows   = -(-n_charts // n_cols)
 
         self._fig.set_size_inches(FIGURE_WIDTH, _figure_height(n_rows))
 
@@ -466,11 +350,6 @@ class OutputModule(TelemetryObserver):
         )
 
         def _build_one_chart(item: tuple) -> tuple:
-            """
-            Pure function — builds one chart axes panel.
-            Returns (ax, line, scatter) tuple.
-            Replaces: for i, buf in enumerate(self._chart_buffers)
-            """
             i, buf = item
             cfg    = buf["cfg"]
             color  = CHART_COLORS[i % len(CHART_COLORS)]
@@ -492,7 +371,6 @@ class OutputModule(TelemetryObserver):
                       facecolor=PANEL, edgecolor=BORDER)
             return ax, line, scatter
 
-        # map() builds every chart, zip(*...) unpacks into three lists
         results = list(map(_build_one_chart, enumerate(self._chart_buffers)))
         self._axes, self._lines, self._scatters = (
             list(map(lambda r: r[0], results)),
@@ -504,29 +382,19 @@ class OutputModule(TelemetryObserver):
         self._ax_tel.set_facecolor(BG)
         self._ax_tel.axis("off")
 
-    # ─────────────────────────────────────────────────────────
-    #  Animation callback (Screen 2 only)
-    # ─────────────────────────────────────────────────────────
-
     def _drain_packets(self, n: int) -> None:
-        """
-        Drain up to n packets from processed_queue using recursion —
-        functional replacement for: for _ in range(25): ...
-        Stops early if queue is empty or sentinel is received.
-        """
         if n == 0 or self._stream_done:
             return
         try:
             packet = self._processed_queue.get_nowait()
         except Exception:
-            return   # queue empty — stop draining
+            return
 
         if packet is None:
             self._stream_done = True
             self._mark_complete()
             return
 
-        # map() feeds this packet into every chart buffer
         def _feed_buf(buf: dict) -> None:
             x_key = buf["cfg"]["x_axis"]
             y_key = _Y_KEY.get(buf["cfg"]["type"], "metric_value")
@@ -536,13 +404,9 @@ class OutputModule(TelemetryObserver):
 
         list(map(_feed_buf, self._chart_buffers))
         self._packets_received += 1
-        self._drain_packets(n - 1)   # tail recursion for remaining slots
+        self._drain_packets(n - 1)
 
     def _update_one_chart(self, item: tuple) -> None:
-        """
-        Pure function — updates one chart panel from its buffer.
-        Replaces: for i, buf in enumerate(self._chart_buffers) in _animate.
-        """
         i, buf = item
         if not buf["x"]:
             return
@@ -586,7 +450,7 @@ class OutputModule(TelemetryObserver):
             ax.set_xlim(min(xs) - x_pad, max(xs) + x_pad)
             ax.set_ylim(min(ys) - y_pad, max(ys) + y_pad)
 
-        else:   # line chart
+        else:
             self._lines[i].set_data(xs, ys)
             self._scatters[i].set_offsets([[xs[-1], ys[-1]]])
             ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=6))
@@ -595,16 +459,11 @@ class OutputModule(TelemetryObserver):
             ax.autoscale_view()
 
     def _animate(self, frame: int):
-        """Called by FuncAnimation every 150ms."""
         self._drain_packets(25)
-        # map() updates every chart — replaces: for i, buf in enumerate(...)
+
         list(map(self._update_one_chart, enumerate(self._chart_buffers)))
         self._draw_telemetry()
         return self._lines
-
-    # ─────────────────────────────────────────────────────────
-    #  Telemetry bar renderer (Screen 2)
-    # ─────────────────────────────────────────────────────────
 
     def _draw_telemetry(self) -> None:
         ax = self._ax_tel
@@ -627,7 +486,6 @@ class OutputModule(TelemetryObserver):
                     ha="center", va="center", color=DIM, fontsize=9)
             return
 
-        # filter() picks only the enabled streams — replaces three if-appends
         all_streams = [
             ("show_raw_stream",          "q1"),
             ("show_intermediate_stream", "q2"),
@@ -651,14 +509,9 @@ class OutputModule(TelemetryObserver):
         bar_width  = bar_right - bar_left
         bar_height = min(0.18, spacing * 0.5)
 
-        # y_slots computed with map() — replaces list comprehension with range
         y_slots = list(map(lambda i: spacing * (n - i), range(n)))
 
         def _draw_one_bar(bar_item: tuple) -> None:
-            """
-            Pure function — draws one telemetry bar.
-            Replaces: for (key, q), y in zip(bars_to_show, y_slots)
-            """
             (key, q), y = bar_item
             fill  = q["fill_ratio"]
             color = QUEUE_BAR_COLORS.get(q["color"], BAR_GREEN)
@@ -682,10 +535,8 @@ class OutputModule(TelemetryObserver):
                         ha="center", va="center",
                         color="white", fontsize=8, fontweight="bold")
 
-        # map() draws every bar — replaces: for (key, q), y in zip(...)
         list(map(_draw_one_bar, zip(bars_to_show, y_slots)))
 
-        # Legend — map() replaces: for label, color, xpos in [...]
         legend_items = [
             ("● Flowing",      BAR_GREEN,  0.28),
             ("● Filling",      BAR_YELLOW, 0.50),
@@ -698,15 +549,7 @@ class OutputModule(TelemetryObserver):
             legend_items
         ))
 
-    # ─────────────────────────────────────────────────────────
-    #  Complete marker
-    # ─────────────────────────────────────────────────────────
-
     def _mark_complete(self) -> None:
-        """
-        Update all chart titles when stream finishes.
-        map() replaces: for i, buf in enumerate(self._chart_buffers)
-        """
         def _mark_one(item: tuple) -> None:
             i, buf = item
             if i < len(self._axes):
@@ -716,16 +559,7 @@ class OutputModule(TelemetryObserver):
                 )
         list(map(_mark_one, enumerate(self._chart_buffers)))
 
-    # ─────────────────────────────────────────────────────────
-    #  Entry point
-    # ─────────────────────────────────────────────────────────
-
     def run(self) -> None:
-        """
-        Entry point — called inside a multiprocessing.Process by main.py.
-        1. Initialises matplotlib (deferred — only runs in OutputProcess)
-        2. Builds Screen 1, draws validating state, calls plt.show()
-        """
         _init_matplotlib()
         print(f"[Output] Dashboard starting (backend: {_BACKEND}) ...")
         self._build_screen1()
