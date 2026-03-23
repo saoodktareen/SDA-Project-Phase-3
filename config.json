@@ -1,73 +1,65 @@
 {
-  "dataset_path": "data/sample_sensor_data.csv",
-  "pipeline_dynamics": {
-    "input_delay_seconds": 0.02,
-    "core_parallelism": 4,
-    "stream_queue_max_size": 50
-  },
-  "schema_mapping": {
-    "columns": [
-      {"source_name": "Sensor_ID",      "internal_mapping": "entity_name",  "data_type": "string"},
-      {"source_name": "Timestamp",      "internal_mapping": "time_period",  "data_type": "integer"},
-      {"source_name": "Raw_Value",      "internal_mapping": "metric_value", "data_type": "float"},
-      {"source_name": "Auth_Signature", "internal_mapping": "security_hash","data_type": "string"}
-    ]
-  },
-  "processing": {
-    "stateless_tasks": {
-      "operation": "verify_signature",
-      "algorithm": "pbkdf2_hmac",
-      "iterations": 100000,
-      "secret_key": "sda_spring_2026_secure_key"
+    "dataset_path": "data/sample_sensor_data.csv",
+    "pipeline_dynamics": {
+        "input_delay_seconds": 0.01,
+        "core_parallelism": 4,
+        "stream_queue_max_size": 50
     },
-    "stateful_tasks": {
-      "operation": "running_average",
-      "running_average_window_size": 10
+    "schema_mapping": {
+        "columns": [
+            {
+                "source_name": "Sensor_ID",
+                "internal_mapping": "entity_name",
+                "data_type": "string"
+            },
+            {
+                "source_name": "Timestamp",
+                "internal_mapping": "time_period",
+                "data_type": "integer"
+            },
+            {
+                "source_name": "Raw_Value",
+                "internal_mapping": "metric_value",
+                "data_type": "float"
+            },
+            {
+                "source_name": "Auth_Signature",
+                "internal_mapping": "security_hash",
+                "data_type": "string"
+            }
+        ]
+    },
+    "processing": {
+        "stateless_tasks": {
+            "operation": "verify_signature",
+            "algorithm": "pbkdf2_hmac",
+            "iterations": 100000,
+            "secret_key": "sda_spring_2026_secure_key"
+        },
+        "stateful_tasks": {
+            "operation": "running_average",
+            "running_average_window_size": 10
+        }
+    },
+    "visualizations": {
+        "telemetry": {
+            "show_raw_stream": true,
+            "show_intermediate_stream": true,
+            "show_processed_stream": true
+        },
+        "data_charts": [
+            {
+                "type": "real_time_line_graph_values",
+                "title": "Live Sensor Values (Authentic Only)",
+                "x_axis": "time_period",
+                "y_axis": "metric_value"
+            },
+            {
+                "type": "real_time_line_graph_average",
+                "title": "Live Sensor Running Average",
+                "x_axis": "time_period",
+                "y_axis": "computed_metric"
+            }
+        ]
     }
-  },
-  "visualizations": {
-    "telemetry": {
-      "show_raw_stream": true,
-      "show_intermediate_stream": true,
-      "show_processed_stream": true
-    },
-    "data_charts": [
-      {
-        "type": "real_time_line_graph_values",
-        "title": "Line — Raw Values",
-        "x_axis": "time_period",
-        "y_axis": "metric_value"
-      },
-      {
-        "type": "real_time_line_graph_average",
-        "title": "Line — Running Average",
-        "x_axis": "time_period",
-        "y_axis": "computed_metric"
-      },
-      {
-        "type": "real_time_bar_chart_values",
-        "title": "Bar — Raw Values",
-        "x_axis": "time_period",
-        "y_axis": "metric_value"
-      },
-      {
-        "type": "real_time_bar_chart_average",
-        "title": "Bar — Running Average",
-        "x_axis": "time_period",
-        "y_axis": "computed_metric"
-      },
-      {
-        "type": "real_time_scatter_values",
-        "title": "Scatter — Raw Values",
-        "x_axis": "time_period",
-        "y_axis": "metric_value"
-      },
-      {
-        "type": "real_time_scatter_average",
-        "title": "Scatter — Running Average",
-        "x_axis": "time_period",
-        "y_axis": "computed_metric"
-      }
-    ]
-  }
 }
