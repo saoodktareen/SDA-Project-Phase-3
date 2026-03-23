@@ -1,7 +1,7 @@
 {
   "dataset_path": "data/sample_sensor_data.csv",
   "pipeline_dynamics": {
-    "input_delay_seconds": 0.05,
+    "input_delay_seconds": 0.02,
     "core_parallelism": 4,
     "stream_queue_max_size": 50
   },
