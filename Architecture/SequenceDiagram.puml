@@ -1,4 +1,4 @@
-@startuml
+@startuml SequenceDiagram
 
 skinparam sequenceMessageAlign center
 skinparam sequenceFontSize 12
@@ -26,7 +26,7 @@ Output -> Output : draw Screen 1
 == Start ==
 Output -> Main : start_event.set() [button click]
 Output -> Tel  : start telemetry thread
-Tel -> Output  : subscribe(output)
+Output -> Tel  : subscribe(output)
 Output -> Output : draw Screen 2
 
 == Stream (loop) ==
